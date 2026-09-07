@@ -41,6 +41,9 @@ SUBMITTED = 2
 VALIDATED = 3
 DISPUTED = 4
 CANCELLED = 5
+# Neither the validator nor the fallback judged inside their windows: the escrow
+# is split evenly so that neither party holds a free default win.
+SPLIT = 6
 
 
 class Bid(arc4.Struct):
@@ -53,6 +56,12 @@ class Bid(arc4.Struct):
     # commitment to it does not.
     pitch_hash: arc4.DynamicBytes
     placed_at: arc4.UInt64
+    # The validator named on the job when this bid was placed. accept_bid refuses
+    # a bid whose terms the client has since changed under the bidder.
+    validator_agent_id: arc4.UInt64
+    # Who judges if the job's validator stays silent for a window. Chosen by the
+    # BIDDER; the client consents to it by accepting the bid.
+    fallback_validator_agent_id: arc4.UInt64
 
 
 class Job(arc4.Struct):
@@ -71,6 +80,10 @@ class Job(arc4.Struct):
     status: arc4.UInt64
     created_at: arc4.UInt64
     updated_at: arc4.UInt64
+    # Second judge, used only once validator_agent_id has been silent for a
+    # window. Named by whoever initiates the pairing (the assigning client, or
+    # the bidder via accept_bid), and never a party to the job.
+    fallback_validator_agent_id: arc4.UInt64
 
 
 class EscrowPaid(arc4.Struct):
@@ -112,6 +125,11 @@ class ValidationRegistry(ARC4Contract):
         # Zero or absent means nothing is held, which is the honest default:
         # posting a job commits no money until fund_job runs.
         self.escrow = BoxMap(UInt64, UInt64, key_prefix=b"es_")
+
+        # The client's half of a SPLIT job. Kept in its own box so it can be
+        # claimed without resolving the worker (whose half lives in es_), and so
+        # a departed worker strands only their own half, never the client's.
+        self.split_refund = BoxMap(UInt64, UInt64, key_prefix=b"rf_")
 
         # The asset escrow is denominated in. Fixed at bootstrap for the same
         # reason the ReputationRegistry fixes its own: an escrow the caller
@@ -240,13 +258,25 @@ class ValidationRegistry(ARC4Contract):
             status=arc4.UInt64(OPEN),
             created_at=arc4.UInt64(now),
             updated_at=arc4.UInt64(now),
+            fallback_validator_agent_id=arc4.UInt64(0),
         )
         self._assert_covers_box_growth(mbr, mbr_before)
         return arc4.UInt64(jid)
 
     @arc4.abimethod
-    def assign_job(self, job_id: arc4.UInt64, server_agent_id: arc4.UInt64) -> arc4.Bool:
-        """Give the job to an agent. Client only, and only while still open."""
+    def assign_job(
+        self,
+        job_id: arc4.UInt64,
+        server_agent_id: arc4.UInt64,
+        fallback_validator_agent_id: arc4.UInt64,
+    ) -> arc4.Bool:
+        """Give the job to an agent. Client only, and only while still open.
+
+        The client names the fallback judge here (or 0 for none): the agent who
+        may judge if the named validator stays silent for a window. The worker
+        consents by having taken the assignment. A fallback may not be either
+        party or the validator itself.
+        """
         jid = job_id.native
         assert jid in self.jobs, "unknown job"
         j = self.jobs[jid].copy()
@@ -254,7 +284,15 @@ class ValidationRegistry(ARC4Contract):
         assert j.status.native == OPEN, "job is no longer open"
         assert server_agent_id.native > 0, "agent id required"
 
+        self._check_fallback(
+            fallback_validator_agent_id,
+            j.validator_agent_id,
+            server_agent_id,
+            j.client.native,
+            self._agent_address(server_agent_id),
+        )
         j.server_agent_id = server_agent_id
+        j.fallback_validator_agent_id = fallback_validator_agent_id
         j.status = arc4.UInt64(ASSIGNED)
         j.updated_at = arc4.UInt64(self._now())
         self.jobs[jid] = j.copy()
@@ -297,50 +335,41 @@ class ValidationRegistry(ARC4Contract):
         return arc4.Bool(True)  # noqa: FBT003
 
     @arc4.abimethod
-    def validation_response(self, job_id: arc4.UInt64, passed: arc4.Bool) -> arc4.UInt64:
-        """Judge a submitted result. Returns the resulting status."""
+    def validation_response(
+        self, job_id: arc4.UInt64, passed: arc4.Bool, as_validator: arc4.UInt64
+    ) -> arc4.UInt64:
+        """Judge a submitted result. Returns the resulting status.
+
+        `as_validator` is the agent id the caller is acting as: the named
+        validator, or the fallback once the validator's window has passed. Only
+        the id the caller CLAIMS is resolved, so a validator that has deregistered
+        cannot strand the job — the fallback simply acts. No one gets a unilateral
+        verdict. An earlier fix let the client judge a silent validator's job, but
+        that only moved the free option to the client, who could then reject
+        delivered work and refund. The fallback is named at pairing time
+        (assign_job / accept_bid), is never a party to the job, and the other side
+        consents to it by committing. If BOTH judges stay silent, expire_verdict
+        splits the escrow — neither side wins by default.
+        """
         jid = job_id.native
         assert jid in self.jobs, "unknown job"
         j = self.jobs[jid].copy()
         assert j.status.native == SUBMITTED, "nothing has been submitted to judge"
 
-        # Either the named validator's controlling address, or the client when no
-        # validator was named. Anyone else judging would make the verdict noise.
-        #
-        # This used to read `client == sender OR validator_agent_id > 0`, which
-        # is vacuous the moment a validator IS named: the second clause is true
-        # regardless of who is calling, so any address could mark any submitted
-        # job validated. An "or" over a fact about the JOB can never authorise
-        # the SENDER.
-        #
-        # Resolved against the IdentityRegistry, because that is the only place
-        # an address-to-id binding is authenticated.
         if j.validator_agent_id.native > 0:
-            # The named validator may judge at any time. But a validator that
-            # never answers must not force the client to accept the work: once
-            # the validator's window has passed, the CLIENT may judge it too.
-            # Without this the client had no veto on a validator-named job — a
-            # garbage submission plus one window of validator silence was a
-            # guaranteed full payout that anyone could trigger via expire_verdict,
-            # and a validator that had deregistered (its id no longer resolves)
-            # left NOBODY able to judge. The client path deliberately does not
-            # resolve the validator id, so a dead validator no longer strands the
-            # job. expire_verdict now waits a second window, so this fallback is a
-            # real veto and not a race against it.
-            past_validator_window = (
+            primary_silent = (
                 Global.latest_timestamp > j.updated_at.native + self.dispute_window
             )
-            if past_validator_window and Txn.sender == j.client.native:
-                pass
-            else:
-                validator_addr, _txn = arc4.abi_call[arc4.Address](
-                    "agent_address(uint64)address",
-                    j.validator_agent_id,
-                    app_id=self.identity_app,
-                )
-                assert (
-                    Txn.sender == validator_addr.native
-                ), "only the named validator may judge this job (the client may, once the validator's window passes)"
+            is_primary = as_validator == j.validator_agent_id
+            is_fallback = (
+                primary_silent
+                and j.fallback_validator_agent_id.native > 0
+                and as_validator == j.fallback_validator_agent_id
+            )
+            assert (
+                is_primary or is_fallback
+            ), "only the named validator may judge, or the fallback once the validator's window has passed"
+            assert Txn.sender == self._agent_address(as_validator), "you do not control that validator"
         else:
             assert j.client.native == Txn.sender, "only the client may judge a job with no validator"
 
@@ -396,6 +425,32 @@ class ValidationRegistry(ARC4Contract):
             app_id=self.reputation_app,
         )
         return arc4.Bool(True)  # noqa: FBT003
+
+    @subroutine
+    def _check_fallback(
+        self,
+        fallback: arc4.UInt64,
+        primary: arc4.UInt64,
+        server: arc4.UInt64,
+        client: Account,
+        server_addr: Account,
+    ) -> None:
+        """A fallback judge may not be the validator, the worker, or the client.
+
+        Best effort: a second agent the SAME operator controls is
+        indistinguishable on chain from an independent judge, so a worker can
+        still route the fallback to a puppet id. That residual cannot be closed
+        in the contract — which is why the fallback is named where the other side
+        sees it before they commit (a bid field, a job field), and closing it
+        fully needs a protocol-level arbiter, a policy choice left to the
+        deployment. What is enforceable is refused here.
+        """
+        if fallback.native > 0:
+            assert fallback != primary, "the fallback must differ from the validator"
+            assert fallback != server, "the worker cannot be their own fallback judge"
+            fb_addr = self._agent_address(fallback)
+            assert fb_addr != client, "the client cannot be the fallback judge"
+            assert fb_addr != server_addr, "the worker cannot be the fallback judge"
 
     @subroutine
     def _agent_address(self, agent_id: arc4.UInt64) -> Account:
@@ -653,6 +708,7 @@ class ValidationRegistry(ARC4Contract):
         bidder_agent_id: arc4.UInt64,
         price_micro: arc4.UInt64,
         pitch_hash: arc4.DynamicBytes,
+        fallback_validator_agent_id: arc4.UInt64,
     ) -> arc4.Bool:
         """Offer to do a job. Only the bidding agent's own address may bid.
 
@@ -680,6 +736,12 @@ class ValidationRegistry(ARC4Contract):
         assert Txn.sender == bidder, "only the bidding agent may place its own bid"
         assert Txn.sender != j.client.native, "the client cannot bid on their own job"
 
+        # The fallback the bidder proposes is validated against the job's terms
+        # now, so an accepting client sees an already-legal fallback.
+        self._check_fallback(
+            fallback_validator_agent_id, j.validator_agent_id, bidder_agent_id, j.client.native, bidder
+        )
+
         mbr_before = Global.current_application_address.min_balance
         self.bids[self._bid_key(jid, bidder_agent_id.native)] = Bid(
             job_id=job_id,
@@ -687,6 +749,8 @@ class ValidationRegistry(ARC4Contract):
             price_micro=price_micro,
             pitch_hash=pitch_hash.copy(),
             placed_at=arc4.UInt64(self._now()),
+            validator_agent_id=j.validator_agent_id,
+            fallback_validator_agent_id=fallback_validator_agent_id,
         )
         self._assert_covers_box_growth(mbr, mbr_before)
         return arc4.Bool(True)  # noqa: FBT003
@@ -726,13 +790,25 @@ class ValidationRegistry(ARC4Contract):
         return arc4.Bool(True)  # noqa: FBT003
 
     @arc4.abimethod
-    def accept_bid(self, job_id: arc4.UInt64, bidder_agent_id: arc4.UInt64) -> arc4.Bool:
+    def accept_bid(
+        self,
+        job_id: arc4.UInt64,
+        bidder_agent_id: arc4.UInt64,
+        expected_price_micro: arc4.UInt64,
+    ) -> arc4.Bool:
         """Assign the job to a bidder, at the price they bid.
 
         The budget is overwritten with the bid, which is the point: accepting an
         offer of 0.4 on a job budgeted at 1.0 should leave the record saying
         0.4. Leaving the old number would mean the job, the escrow and any
         release all disagree about what was agreed.
+
+        The terms are pinned to what the client read. `expected_price_micro` must
+        equal the bid's price, and the bid's recorded validator must still be the
+        job's validator — otherwise a bidder could raise the price, or the client
+        could change the validator, between the client reading the bid and
+        accepting it. The bidder's proposed fallback judge is copied onto the job,
+        so accepting a bid IS the client's consent to that fallback.
 
         The bid box is NOT swept here. Losing bids stay readable until the
         client withdraws them or the bidders do — a board that erases what it
@@ -747,8 +823,18 @@ class ValidationRegistry(ARC4Contract):
         key = self._bid_key(jid, bidder_agent_id.native)
         assert key in self.bids, "no such bid"
         bid = self.bids[key].copy()
+        assert bid.price_micro == expected_price_micro, "the bid changed since you read it"
+        assert bid.validator_agent_id == j.validator_agent_id, "the validator changed since this bid was placed"
 
+        self._check_fallback(
+            bid.fallback_validator_agent_id,
+            j.validator_agent_id,
+            bidder_agent_id,
+            j.client.native,
+            self._agent_address(bidder_agent_id),
+        )
         j.server_agent_id = bidder_agent_id
+        j.fallback_validator_agent_id = bid.fallback_validator_agent_id
         j.budget_micro = bid.price_micro
         j.status = arc4.UInt64(ASSIGNED)
         j.updated_at = arc4.UInt64(self._now())
@@ -871,39 +957,31 @@ class ValidationRegistry(ARC4Contract):
 
     @arc4.abimethod
     def expire_verdict(self, job_id: arc4.UInt64) -> arc4.Bool:
-        """Accept a submitted result the validator never judged.
+        """Resolve a submitted result that NEITHER judge answered, by splitting.
 
-        SUBMITTED had exactly one exit — `validation_response`, which only the
-        named validator may call. A validator who loses their key, abandons the
-        agent, rotates away or simply declines therefore froze the escrow
-        permanently: `expire_job` refuses anything past ASSIGNED, so neither the
-        client, the worker, nor a third party could move the job. The USDC and
-        the `es_` box it needs were locked with no on-chain remedy, and an `es_`
-        box that can never be removed also blocks deleting the app.
+        SUBMITTED had exactly one exit — `validation_response`. A validator who
+        loses their key, abandons the agent, rotates away or simply declines
+        therefore froze the escrow permanently: `expire_job` refuses anything past
+        ASSIGNED, so nobody could move the job, and the `es_` box it needs was
+        locked with no on-chain remedy, which also blocks deleting the app.
 
-        The window already encodes what silence means everywhere else in this
-        contract: `release_escrow` lets anyone release once it closes, precisely
-        so a validator who never returns cannot freeze a worker's money. This
-        applies the same rule one state later — a result neither the validator
-        nor the client judged stands.
+        It waits TWO windows, because there are two judges: the validator's own
+        window, then the fallback's. Only if BOTH stay silent does this fire.
 
-        It waits TWO dispute windows, not one, because the client is now a
-        fallback judge: after the first window a silent validator hands the
-        judgement to the client (see validation_response), so forcing a pass must
-        wait until the client has also had a window and stayed silent. One window
-        would have let anyone force a pass the moment the validator's window
-        closed, before the client could exercise the veto that fallback gives
-        them.
+        And it SPLITS the escrow rather than handing either side a default win.
+        An earlier version resolved silence to VALIDATED — but that paid a worker
+        who may have submitted garbage in full, simply for the validator not
+        showing up, which is a free option for the worker. Resolving to CANCELLED
+        instead would be the same free option for the client. A 50/50 split gives
+        neither: a worker who delivered garbage keeps only half, and a client who
+        named a dead validator recovers only half. Both are worse off than
+        agreeing a live judge, which is exactly the incentive this should create.
+        The escrow is divided now into two boxes — the worker's half stays in
+        `es_`, the client's half moves to `rf_` — so each half is claimable
+        without the other party's address having to be live.
 
-        It resolves to VALIDATED rather than CANCELLED deliberately. Cancelling
-        would refund the client, which punishes a worker who delivered and
-        rewards a client who waits — and `expire_job`'s own reasoning is that a
-        deadline must never let a client escape a verdict by doing nothing.
-        Here doing nothing costs the client, which is the direction that keeps
-        the incentive honest.
-
-        Anyone may call it, for the same reason `expire_job` is open: a
-        guarantee that only one party can invoke is not a guarantee.
+        Anyone may call it, for the same reason `expire_job` is open: a guarantee
+        that only one party can invoke is not a guarantee.
         """
         jid = job_id.native
         assert jid in self.jobs, "unknown job"
@@ -911,15 +989,53 @@ class ValidationRegistry(ARC4Contract):
         assert j.status.native == SUBMITTED, "only a submitted job awaiting a verdict can expire"
         assert (
             Global.latest_timestamp > j.updated_at.native + self.dispute_window * 2
-        ), "the validator and then the client still have time"
+        ), "the validator, then the fallback, still have time"
 
-        j.status = arc4.UInt64(VALIDATED)
+        j.status = arc4.UInt64(SPLIT)
         j.updated_at = arc4.UInt64(self._now())
         self.jobs[jid] = j.copy()
-        # Escrow is not moved here. release_escrow already handles VALIDATED and
-        # is itself callable by anyone once the window has passed, so the payout
-        # keeps its existing box references and its existing fee handling.
+
+        if jid in self.escrow:
+            amount = self.escrow[jid]
+            worker_half = amount // 2
+            client_half = amount - worker_half  # the odd base unit goes to the client
+            self.split_refund[jid] = client_half
+            if worker_half > 0:
+                self.escrow[jid] = worker_half
+            else:
+                del self.escrow[jid]
         return arc4.Bool(True)  # noqa: FBT003
+
+    @arc4.abimethod
+    def settle_split(self, job_id: arc4.UInt64) -> arc4.UInt64:
+        """Pay the worker's half of a SPLIT job. Anyone; a fee applies as it is a
+        settlement for delivered (if unjudged) work. Returns the amount sent."""
+        jid = job_id.native
+        assert jid in self.jobs, "unknown job"
+        j = self.jobs[jid].copy()
+        assert j.status.native == SPLIT, "only a split job settles this way"
+        return arc4.UInt64(self._pay_escrow(jid, self._agent_address(j.server_agent_id), True))  # noqa: FBT003
+
+    @arc4.abimethod
+    def claim_split_refund(self, job_id: arc4.UInt64) -> arc4.UInt64:
+        """Pay the client's half of a SPLIT job. Anyone may trigger it; the
+        destination is read off the job, so it can only ever go to the client, and
+        it never resolves the worker — a departed worker strands only their own
+        half. No fee: the client is recovering their own money. Returns the amount."""
+        jid = job_id.native
+        assert jid in self.jobs, "unknown job"
+        j = self.jobs[jid].copy()
+        assert j.status.native == SPLIT, "only a split job refunds this way"
+        assert jid in self.split_refund, "nothing to refund"
+        amount = self.split_refund[jid]
+        del self.split_refund[jid]
+        itxn.AssetTransfer(
+            xfer_asset=self.escrow_asset,
+            asset_receiver=j.client.native,
+            asset_amount=amount,
+            fee=0,
+        ).submit()
+        return arc4.UInt64(amount)
 
     @arc4.abimethod
     def set_fee(self, fee_bps: arc4.UInt64, treasury: arc4.Address) -> arc4.Bool:

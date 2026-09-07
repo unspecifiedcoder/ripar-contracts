@@ -181,24 +181,38 @@ def test_expire_verdict_refuses_a_job_not_awaiting_a_verdict(ctx, registry):
             registry.expire_verdict(arc4.UInt64(1))
 
 
-def test_the_window_rule_expire_verdict_applies_is_the_same_one_release_uses(ctx, registry):
-    """
-    `expire_verdict` reuses `latest_timestamp > updated_at + dispute_window`,
-    the same expression `release_escrow` uses to let anyone release. Same
-    strictness at the boundary: at exactly updated_at + window the validator
-    still has time, one second later they do not.
+def _past_two_windows(registry: ValidationRegistry, submitted_at: int) -> bool:
+    """Mirror of expire_verdict's own expression after the audit (R-F1)."""
+    from algopy import Global
 
-    Proving the arithmetic here is what makes the guard trustworthy without a
-    chain — the on-chain path costs a real dispute window per case.
+    return bool(Global.latest_timestamp > submitted_at + registry.dispute_window * 2)
+
+
+def test_expire_verdict_waits_two_windows_so_the_client_veto_is_real(ctx, registry):
+    """
+    After the audit `expire_verdict` requires `latest_timestamp > updated_at +
+    dispute_window * 2`, not one window. The first window is the validator's;
+    once it passes a silent validator hands the judgement to the CLIENT
+    (validation_response's fallback path). Forcing a pass must therefore wait a
+    SECOND window, or anyone could force VALIDATED the instant the validator's
+    window closed and beat the client's veto to it.
+
+    At exactly two windows the client still has time; one second later the
+    result stands. release_escrow keeps the one-window rule, but measured from
+    when the verdict was written — a different clock, so they are no longer the
+    same expression.
     """
     _bootstrap(ctx, registry)
     submitted_at = 1_700_000_000
 
     ctx.ledger.patch_global_fields(latest_timestamp=submitted_at + WINDOW)
-    assert not _past_window(registry, submitted_at), "at the boundary the validator still has time"
+    assert not _past_two_windows(registry, submitted_at), "still the validator's own window"
 
-    ctx.ledger.patch_global_fields(latest_timestamp=submitted_at + WINDOW + 1)
-    assert _past_window(registry, submitted_at), "one second past, the result stands"
+    ctx.ledger.patch_global_fields(latest_timestamp=submitted_at + 2 * WINDOW)
+    assert not _past_two_windows(registry, submitted_at), "at the boundary the client still has its window"
+
+    ctx.ledger.patch_global_fields(latest_timestamp=submitted_at + 2 * WINDOW + 1)
+    assert _past_two_windows(registry, submitted_at), "one second past the second window, the result stands"
 
 
 # --- the protocol fee: bounds, one-shot, and who may set it ---------------

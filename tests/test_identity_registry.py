@@ -31,9 +31,33 @@ def registry(ctx: AlgopyTestContext) -> IdentityRegistry:
     return IdentityRegistry()
 
 
-def _register(ctx, registry, sender, domain: str):
-    with ctx.txn.create_group(active_txn_overrides={"sender": sender}):
-        return registry.new_agent(arc4.String(domain))
+def _app_addr(ctx, registry):
+    return ctx.ledger.get_app(registry).address
+
+
+def _register(ctx, registry, sender, domain: str, mbr_receiver=None, mbr_amount=1_000_000):
+    """Register, attaching the storage payment new_agent now requires.
+
+    The emulator does not model the box minimum-balance delta (min_balance stays
+    put across box creation), so the exact-amount half of the guard can only be
+    proven on chain; what these exercise is that a payment to THIS app from the
+    caller is required, and every other rule around it.
+    """
+    app = _app_addr(ctx, registry)
+    pay = ctx.any.txn.payment(
+        sender=sender, receiver=mbr_receiver or app, amount=mbr_amount
+    )
+    call = ctx.any.txn.application_call(app_id=ctx.ledger.get_app(registry), sender=sender)
+    with ctx.txn.create_group(gtxns=[pay, call], active_txn_index=1):
+        return registry.new_agent(pay, arc4.String(domain))
+
+
+def _update(ctx, registry, sender, agent_id, domain: str):
+    app = _app_addr(ctx, registry)
+    pay = ctx.any.txn.payment(sender=sender, receiver=app, amount=1_000_000)
+    call = ctx.any.txn.application_call(app_id=ctx.ledger.get_app(registry), sender=sender)
+    with ctx.txn.create_group(gtxns=[pay, call], active_txn_index=1):
+        return registry.update_agent(pay, agent_id, arc4.String(domain))
 
 
 # --- registration ---------------------------------------------------------
@@ -90,6 +114,43 @@ def test_an_empty_domain_is_refused(ctx, registry):
         _register(ctx, registry, ctx.any.account(), "")
 
 
+# --- domain canonicalisation (audit R-9) ----------------------------------
+#
+# Byte-exact uniqueness alone let API.ripar.io, api.ripar.io. and unicode
+# homographs each register beside the real api.ripar.io, so a consumer resolving
+# domain -> id -> address could be pointed at a squatter. Registration now
+# refuses anything not already in canonical form.
+
+
+@pytest.mark.parametrize(
+    ("domain", "expected"),
+    [
+        ("API.ripar.io", "lower-case"),
+        ("Api.Ripar.Io", "lower-case"),
+        ("api.ripar.io.", "must not end with a dot"),
+        ("api ripar.io", "spaces or control"),
+        ("api.ripar.io\n", "spaces or control"),
+        ("a" * 62, "too long"),
+    ],
+)
+def test_non_canonical_domains_are_refused(ctx, registry, domain, expected):
+    with pytest.raises(Exception, match=expected):
+        _register(ctx, registry, ctx.any.account(), domain)
+
+
+def test_a_canonical_domain_at_the_length_limit_is_accepted(ctx, registry):
+    """61 bytes is the ceiling: dm_ + domain must fit a 64-byte box key."""
+    assert _register(ctx, registry, ctx.any.account(), "a" * 61).native == 1
+
+
+def test_the_storage_payment_must_be_sent_to_this_app(ctx, registry):
+    """A payment to somewhere else does not fund the boxes this app creates."""
+    caller = ctx.any.account()
+    elsewhere = ctx.any.account()
+    with pytest.raises(Exception, match="storage payment must be sent to this app"):
+        _register(ctx, registry, caller, "wrong.payee.example", mbr_receiver=elsewhere)
+
+
 # --- update ---------------------------------------------------------------
 
 
@@ -99,8 +160,7 @@ def test_only_the_agent_may_update_itself(ctx, registry):
     agent_id = _register(ctx, registry, owner, "owned.example")
 
     with pytest.raises(Exception, match="only the agent may update itself"):
-        with ctx.txn.create_group(active_txn_overrides={"sender": stranger}):
-            registry.update_agent(agent_id, arc4.String("stolen.example"))
+        _update(ctx, registry, stranger, agent_id, "stolen.example")
 
 
 def test_update_cannot_take_a_domain_someone_else_holds(ctx, registry):
@@ -110,14 +170,12 @@ def test_update_cannot_take_a_domain_someone_else_holds(ctx, registry):
     _register(ctx, registry, b, "b.example")
 
     with pytest.raises(Exception, match="domain already registered"):
-        with ctx.txn.create_group(active_txn_overrides={"sender": a}):
-            registry.update_agent(first, arc4.String("b.example"))
+        _update(ctx, registry, a, first, "b.example")
 
 
 def test_updating_an_unknown_agent_is_refused(ctx, registry):
     with pytest.raises(Exception, match="unknown agent"):
-        with ctx.txn.create_group(active_txn_overrides={"sender": ctx.any.account()}):
-            registry.update_agent(arc4.UInt64(9999), arc4.String("ghost.example"))
+        _update(ctx, registry, ctx.any.account(), arc4.UInt64(9999), "ghost.example")
 
 
 # --- address rotation -----------------------------------------------------
@@ -165,6 +223,18 @@ def test_rotating_to_the_same_address_is_refused(ctx, registry):
     with pytest.raises(Exception, match="already the controlling address"):
         with ctx.txn.create_group(active_txn_overrides={"sender": owner}):
             registry.rotate_address(agent_id, arc4.Address(owner))
+
+
+def test_rotating_to_the_zero_address_is_refused(ctx, registry):
+    """Rotating an identity onto the zero address makes it permanently
+    unresolvable and strands anything referencing it — a footgun, not a move."""
+    from algopy import Global
+
+    owner = ctx.any.account()
+    agent_id = _register(ctx, registry, owner, "zero.example")
+    with pytest.raises(Exception, match="cannot rotate to the zero address"):
+        with ctx.txn.create_group(active_txn_overrides={"sender": owner}):
+            registry.rotate_address(agent_id, arc4.Address(Global.zero_address))
 
 
 # --- deregistration -------------------------------------------------------

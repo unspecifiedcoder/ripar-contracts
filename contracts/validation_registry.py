@@ -18,6 +18,7 @@ custody of anyone's USDC — the same non-custodial rule the rest of Ripar follo
 
 from algopy import (
     Account,
+    Application,
     ARC4Contract,
     op,
     Asset,
@@ -190,17 +191,40 @@ class ValidationRegistry(ARC4Contract):
     def _now(self) -> UInt64:
         return Global.latest_timestamp
 
+    @subroutine
+    def _assert_covers_box_growth(self, mbr: gtxn.PaymentTransaction, before: UInt64) -> None:
+        """Every box this app creates or grows raises the app account's minimum
+        balance, and that cost was silently charged to the app itself — so a
+        stranger could post jobs, bid, or fund until the app fell below its
+        minimum and refused everyone. `mbr` is a payment, in the same group,
+        from the caller to this app covering exactly the growth `before` -> now.
+        Call it AFTER the box write, with `before` captured just before it.
+        """
+        app = Global.current_application_address
+        assert mbr.receiver == app, "storage payment must be sent to this app"
+        assert mbr.sender == Txn.sender, "you must pay for the storage you create"
+        assert (
+            mbr.amount >= app.min_balance - before
+        ), "payment must cover the box storage this call adds"
+
     @arc4.abimethod
     def post_job(
         self,
+        mbr: gtxn.PaymentTransaction,
         spec_hash: arc4.DynamicBytes,
         budget_micro: arc4.UInt64,
         validator_agent_id: arc4.UInt64,
     ) -> arc4.UInt64:
-        """Open a job. The spec is committed by hash so it cannot change later."""
+        """Open a job. The spec is committed by hash so it cannot change later.
+
+        `mbr` covers the `jb_` box this creates; without it a stranger could
+        post jobs until the app account fell below its minimum balance and every
+        fund_job, bid and registration failed for good.
+        """
         assert spec_hash.native.length == 32, "spec_hash must be a sha256 digest"
         assert budget_micro.native > 0, "a job with no budget attracts no bids"
 
+        mbr_before = Global.current_application_address.min_balance
         self.job_count += 1
         jid = self.job_count
         now = self._now()
@@ -217,6 +241,7 @@ class ValidationRegistry(ARC4Contract):
             created_at=arc4.UInt64(now),
             updated_at=arc4.UInt64(now),
         )
+        self._assert_covers_box_growth(mbr, mbr_before)
         return arc4.UInt64(jid)
 
     @arc4.abimethod
@@ -236,8 +261,14 @@ class ValidationRegistry(ARC4Contract):
         return arc4.Bool(True)  # noqa: FBT003
 
     @arc4.abimethod
-    def submit_result(self, job_id: arc4.UInt64, result_hash: arc4.DynamicBytes) -> arc4.Bool:
-        """The assignee commits its result by hash. The payload stays offchain."""
+    def submit_result(
+        self, mbr: gtxn.PaymentTransaction, job_id: arc4.UInt64, result_hash: arc4.DynamicBytes
+    ) -> arc4.Bool:
+        """The assignee commits its result by hash. The payload stays offchain.
+
+        `mbr` covers the growth of the `jb_` box: the result hash goes from empty
+        to 32 bytes, and that added storage is charged to the app account.
+        """
         jid = job_id.native
         assert jid in self.jobs, "unknown job"
         assert result_hash.native.length == 32, "result_hash must be a sha256 digest"
@@ -257,10 +288,12 @@ class ValidationRegistry(ARC4Contract):
         )
         assert Txn.sender == assignee_addr.native, "only the assigned agent may submit a result"
 
+        mbr_before = Global.current_application_address.min_balance
         j.result_hash = result_hash.copy()
         j.status = arc4.UInt64(SUBMITTED)
         j.updated_at = arc4.UInt64(self._now())
         self.jobs[jid] = j.copy()
+        self._assert_covers_box_growth(mbr, mbr_before)
         return arc4.Bool(True)  # noqa: FBT003
 
     @arc4.abimethod
@@ -283,12 +316,31 @@ class ValidationRegistry(ARC4Contract):
         # Resolved against the IdentityRegistry, because that is the only place
         # an address-to-id binding is authenticated.
         if j.validator_agent_id.native > 0:
-            validator_addr, _txn = arc4.abi_call[arc4.Address](
-                "agent_address(uint64)address",
-                j.validator_agent_id,
-                app_id=self.identity_app,
+            # The named validator may judge at any time. But a validator that
+            # never answers must not force the client to accept the work: once
+            # the validator's window has passed, the CLIENT may judge it too.
+            # Without this the client had no veto on a validator-named job — a
+            # garbage submission plus one window of validator silence was a
+            # guaranteed full payout that anyone could trigger via expire_verdict,
+            # and a validator that had deregistered (its id no longer resolves)
+            # left NOBODY able to judge. The client path deliberately does not
+            # resolve the validator id, so a dead validator no longer strands the
+            # job. expire_verdict now waits a second window, so this fallback is a
+            # real veto and not a race against it.
+            past_validator_window = (
+                Global.latest_timestamp > j.updated_at.native + self.dispute_window
             )
-            assert Txn.sender == validator_addr.native, "only the named validator may judge this job"
+            if past_validator_window and Txn.sender == j.client.native:
+                pass
+            else:
+                validator_addr, _txn = arc4.abi_call[arc4.Address](
+                    "agent_address(uint64)address",
+                    j.validator_agent_id,
+                    app_id=self.identity_app,
+                )
+                assert (
+                    Txn.sender == validator_addr.native
+                ), "only the named validator may judge this job (the client may, once the validator's window passes)"
         else:
             assert j.client.native == Txn.sender, "only the client may judge a job with no validator"
 
@@ -301,19 +353,49 @@ class ValidationRegistry(ARC4Contract):
         j.updated_at = arc4.UInt64(self._now())
         self.jobs[jid] = j.copy()
 
-        # Write the verdict to the agent's score. This call is the whole reason
-        # the Score struct has validated and disputed fields; without it they
-        # were permanently zero while jobs were being judged, and a reader
-        # comparing "2 jobs validated" against "validated: 0" had no way to
-        # tell which number was wrong.
+        # The verdict is NOT written to the reputation score here, deliberately.
+        # It used to be an inner call to record_validation, which creates a score
+        # box the reputation app pays for — so once that app was starved of
+        # minimum balance, the inner call reverted and took the whole verdict
+        # down with it. A validator's honest "fail" could then never be
+        # recorded, and after the window expire_verdict forced the job to a pass
+        # and the worker was paid for rejected work. The judgement must not
+        # depend on anyone else's storage. The verdict now lives only on the job
+        # here; record_job_verdict syncs it to the score as a separate, funded,
+        # retryable step that can never block this one.
+        return arc4.UInt64(new_status)
+
+    @arc4.abimethod
+    def record_job_verdict(self, mbr: gtxn.PaymentTransaction, job_id: arc4.UInt64) -> arc4.Bool:
+        """Write a decided job's verdict through to the agent's reputation score.
+
+        Split out of validation_response so a starved reputation app can never
+        block a verdict (see the note there). Anyone may call it once the job is
+        VALIDATED or DISPUTED; `passed` is read off the job's own status, not
+        supplied. `mbr` pays the reputation app for the score and dedupe boxes
+        that credit may create — record_validation there refuses a second
+        recording of the same job, so this cannot be replayed to inflate a count.
+        """
+        jid = job_id.native
+        assert jid in self.jobs, "unknown job"
+        j = self.jobs[jid].copy()
+        status = j.status.native
+        assert status == VALIDATED or status == DISPUTED, "no verdict has been decided yet"
+
+        rep = Application(self.reputation_app).address
+        assert mbr.receiver == rep, "storage payment must be sent to the reputation app"
+        assert mbr.sender == Txn.sender, "you must pay for the storage you create"
+        # One score box (~0.0293 ALGO) plus one dedupe box (~0.0073) worst case.
+        assert mbr.amount >= 37_000, "payment must cover the score and dedupe boxes (>=0.037 ALGO)"
+
         arc4.abi_call(
-            "record_validation(uint64,bool)bool",
+            "record_validation(uint64,uint64,bool)bool",
+            job_id,
             j.server_agent_id,
-            passed,
+            arc4.Bool(status == VALIDATED),
             app_id=self.reputation_app,
         )
-
-        return arc4.UInt64(new_status)
+        return arc4.Bool(True)  # noqa: FBT003
 
     @subroutine
     def _agent_address(self, agent_id: arc4.UInt64) -> Account:
@@ -331,7 +413,7 @@ class ValidationRegistry(ARC4Contract):
         return addr.native
 
     @subroutine
-    def _pay_escrow(self, job_id: UInt64, to: Account) -> UInt64:
+    def _pay_escrow(self, job_id: UInt64, to: Account, charge_fee: bool) -> UInt64:  # noqa: FBT001
         """Send the whole escrow for a job and zero the record. Returns the amount.
 
         The box is cleared BEFORE the transfer is submitted. If it were cleared
@@ -339,6 +421,11 @@ class ValidationRegistry(ARC4Contract):
         this app no longer intends to hold — and if the clear itself failed,
         the escrow could be paid twice. Ordering it this way makes double
         payment impossible: the second call finds nothing to send.
+
+        `charge_fee` is True only when paying the WORKER on a passing verdict; a
+        refund to the client (a failed verdict, a cancelled job, or a reclaim of
+        stranded escrow) takes no protocol fee — the client is getting their own
+        money back, not settling for delivered work.
         """
         assert job_id in self.escrow, "nothing is escrowed for this job"
         amount = self.escrow[job_id]
@@ -350,7 +437,7 @@ class ValidationRegistry(ARC4Contract):
         # comes out of the settlement — a fee deducted on the way IN would mean
         # the assignee sees a smaller escrow than the budget they accepted.
         fee = UInt64(0)
-        if self.fee_bps > 0:
+        if charge_fee and self.fee_bps > 0:
             fee = amount * self.fee_bps // 10_000
             if fee > 0:
                 itxn.AssetTransfer(
@@ -378,7 +465,12 @@ class ValidationRegistry(ARC4Contract):
         return amount - fee
 
     @arc4.abimethod
-    def fund_job(self, payment: gtxn.AssetTransferTransaction, job_id: arc4.UInt64) -> arc4.UInt64:
+    def fund_job(
+        self,
+        mbr: gtxn.PaymentTransaction,
+        payment: gtxn.AssetTransferTransaction,
+        job_id: arc4.UInt64,
+    ) -> arc4.UInt64:
         """Move the budget into escrow. Returns the total now held.
 
         The transfer is a TRANSACTION IN THIS GROUP, so the amount is read off
@@ -390,6 +482,11 @@ class ValidationRegistry(ARC4Contract):
         perfectly well unfunded, with the budget as a stated intention. What
         funding buys is that the assignee can see the money exists before doing
         the work.
+
+        Funding may not exceed the agreed budget, and `mbr` covers the `es_`
+        box's storage. The cap matters because a payout to the worker is now
+        capped at the budget and the excess refunded to the client — refusing
+        the over-funding at the door keeps that impossible to reach by accident.
         """
         jid = job_id.native
         assert jid in self.jobs, "unknown job"
@@ -405,7 +502,11 @@ class ValidationRegistry(ARC4Contract):
         held = payment.asset_amount
         if jid in self.escrow:
             held += self.escrow[jid]
+        assert held <= j.budget_micro.native, "escrow cannot exceed the agreed budget"
+
+        mbr_before = Global.current_application_address.min_balance
         self.escrow[jid] = held
+        self._assert_covers_box_growth(mbr, mbr_before)
 
         j.updated_at = arc4.UInt64(self._now())
         self.jobs[jid] = j.copy()
@@ -429,7 +530,28 @@ class ValidationRegistry(ARC4Contract):
         past_window = Global.latest_timestamp > j.updated_at.native + self.dispute_window
         assert j.client.native == Txn.sender or past_window, "only the client may release before the dispute window closes"
 
-        paid = self._pay_escrow(jid, self._agent_address(j.server_agent_id))
+        # The worker is never paid more than the agreed budget. Escrow can exceed
+        # it — fund_job now refuses that, but accept_bid rewrites the budget DOWN
+        # to the bid after funding, so a job funded at 1.0 then let at 0.4 holds
+        # 1.0 against a 0.4 budget. Without this the anyone-after-window release
+        # handed the whole 1.0 to the worker and the client had no way to recover
+        # the 0.6. Return the excess to the client first, then settle the rest.
+        # Guarded on the escrow existing so an unfunded-but-validated job still
+        # fails with _pay_escrow's own "nothing is escrowed" message, not a
+        # box-not-found on this read.
+        if jid in self.escrow:
+            held = self.escrow[jid]
+            budget = j.budget_micro.native
+            if held > budget:
+                self.escrow[jid] = budget
+                itxn.AssetTransfer(
+                    xfer_asset=self.escrow_asset,
+                    asset_receiver=j.client.native,
+                    asset_amount=held - budget,
+                    fee=0,
+                ).submit()
+
+        paid = self._pay_escrow(jid, self._agent_address(j.server_agent_id), True)
         return arc4.UInt64(paid)
 
     @arc4.abimethod
@@ -447,7 +569,37 @@ class ValidationRegistry(ARC4Contract):
             j.status.native == DISPUTED or j.status.native == CANCELLED
         ), "escrow is refunded on a failed verdict or a cancelled job"
 
-        paid = self._pay_escrow(jid, j.client.native)
+        paid = self._pay_escrow(jid, j.client.native, False)
+        return arc4.UInt64(paid)
+
+    @arc4.abimethod
+    def reclaim_stranded(self, job_id: arc4.UInt64) -> arc4.UInt64:
+        """Return a passed job's escrow to the client when the worker has made
+        itself unpayable. Returns the amount refunded.
+
+        A VALIDATED job pays the worker at an address resolved live from the
+        IdentityRegistry. If the worker deregisters, or rotates to an address not
+        opted into the asset, that resolution (or the transfer) fails on every
+        release and refund_escrow refuses VALIDATED — so the client's escrow was
+        locked forever and the `es_` box blocked deleting the app.
+
+        This is the client's exit, and it is deliberately slow: only four dispute
+        windows after the verdict. For the first window only the client may
+        release; after it ANYONE may release to the worker, so a worker who is
+        still reachable (or any keeper acting for them) has three further windows
+        to be paid before the client can take the money back. No fee is charged —
+        the client is recovering their own funds, not settling for work.
+        """
+        jid = job_id.native
+        assert jid in self.jobs, "unknown job"
+        j = self.jobs[jid].copy()
+        assert j.status.native == VALIDATED, "only a passed job's escrow can be reclaimed"
+        assert j.client.native == Txn.sender, "only the client may reclaim"
+        assert (
+            Global.latest_timestamp > j.updated_at.native + self.dispute_window * 4
+        ), "the worker still has time to be paid"
+
+        paid = self._pay_escrow(jid, j.client.native, False)
         return arc4.UInt64(paid)
 
     @arc4.abimethod(readonly=True)
@@ -496,6 +648,7 @@ class ValidationRegistry(ARC4Contract):
     @arc4.abimethod
     def place_bid(
         self,
+        mbr: gtxn.PaymentTransaction,
         job_id: arc4.UInt64,
         bidder_agent_id: arc4.UInt64,
         price_micro: arc4.UInt64,
@@ -527,6 +680,7 @@ class ValidationRegistry(ARC4Contract):
         assert Txn.sender == bidder, "only the bidding agent may place its own bid"
         assert Txn.sender != j.client.native, "the client cannot bid on their own job"
 
+        mbr_before = Global.current_application_address.min_balance
         self.bids[self._bid_key(jid, bidder_agent_id.native)] = Bid(
             job_id=job_id,
             bidder_agent_id=bidder_agent_id,
@@ -534,16 +688,41 @@ class ValidationRegistry(ARC4Contract):
             pitch_hash=pitch_hash.copy(),
             placed_at=arc4.UInt64(self._now()),
         )
+        self._assert_covers_box_growth(mbr, mbr_before)
         return arc4.Bool(True)  # noqa: FBT003
 
     @arc4.abimethod
     def withdraw_bid(self, job_id: arc4.UInt64, bidder_agent_id: arc4.UInt64) -> arc4.Bool:
-        """Take a bid back, and reclaim its box. Bidder only."""
+        """Take a bid back, and reclaim its box.
+
+        The bidder may always withdraw their own bid. The CLIENT may also sweep a
+        bid once the job has left OPEN. Without that second path a losing bid
+        whose bidder later deregisters is a box nobody can remove — the bidder
+        resolution below would revert for everyone — and a box nobody can remove
+        blocks deleting the app forever. The client only reaches it on an
+        already-decided job, so it cannot pull a live competitor's bid; the freed
+        deposit goes to whoever does the cleanup.
+        """
         jid = job_id.native
+        assert jid in self.jobs, "unknown job"
         key = self._bid_key(jid, bidder_agent_id.native)
         assert key in self.bids, "no such bid"
-        assert Txn.sender == self._agent_address(bidder_agent_id), "only the bidder may withdraw"
+
+        j = self.jobs[jid].copy()
+        if Txn.sender == j.client.native and j.status.native != OPEN:
+            pass
+        else:
+            assert (
+                Txn.sender == self._agent_address(bidder_agent_id)
+            ), "only the bidder may withdraw (or the client, once the job has left OPEN)"
+
+        app = Global.current_application_address
+        mbr_before = app.min_balance
         del self.bids[key]
+        # Return the storage deposit place_bid took now that the box is gone.
+        freed = mbr_before - app.min_balance
+        if freed > 0:
+            itxn.Payment(receiver=Txn.sender, amount=freed, fee=0).submit()
         return arc4.Bool(True)  # noqa: FBT003
 
     @arc4.abimethod
@@ -705,8 +884,16 @@ class ValidationRegistry(ARC4Contract):
         The window already encodes what silence means everywhere else in this
         contract: `release_escrow` lets anyone release once it closes, precisely
         so a validator who never returns cannot freeze a worker's money. This
-        applies the same rule one state earlier — a result nobody disputed
-        inside the window stands.
+        applies the same rule one state later — a result neither the validator
+        nor the client judged stands.
+
+        It waits TWO dispute windows, not one, because the client is now a
+        fallback judge: after the first window a silent validator hands the
+        judgement to the client (see validation_response), so forcing a pass must
+        wait until the client has also had a window and stayed silent. One window
+        would have let anyone force a pass the moment the validator's window
+        closed, before the client could exercise the veto that fallback gives
+        them.
 
         It resolves to VALIDATED rather than CANCELLED deliberately. Cancelling
         would refund the client, which punishes a worker who delivered and
@@ -723,8 +910,8 @@ class ValidationRegistry(ARC4Contract):
         j = self.jobs[jid].copy()
         assert j.status.native == SUBMITTED, "only a submitted job awaiting a verdict can expire"
         assert (
-            Global.latest_timestamp > j.updated_at.native + self.dispute_window
-        ), "the validator still has time"
+            Global.latest_timestamp > j.updated_at.native + self.dispute_window * 2
+        ), "the validator and then the client still have time"
 
         j.status = arc4.UInt64(VALIDATED)
         j.updated_at = arc4.UInt64(self._now())

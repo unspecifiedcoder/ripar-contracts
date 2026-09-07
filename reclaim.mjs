@@ -15,6 +15,8 @@
  */
 import algosdk from "algosdk";
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { configPath } from "./config-path.mjs";
 
 const cfg = JSON.parse(fs.readFileSync(configPath("testnet-e2e.json"), "utf8"));
@@ -31,8 +33,37 @@ const signer = algosdk.makeBasicAccountTransactionSigner(acct);
  *
  *  This named 768_633_998/999/634_000 — the SUPERSEDED generation — which meant
  *  the guard protected three dead apps while leaving the live registries
- *  unprotected against exactly the deletion this script performs. */
-const KEEP = new Set([769_444_119, 769_444_120, 769_444_121]);
+ *  unprotected against exactly the deletion this script performs. Then it was
+ *  hard-coded to 769_444_119/120/121 — ALSO superseded by the time it ran — so
+ *  the same footgun fired twice: the KEEP set was a copy that drifted, and once
+ *  it lagged the live ids this script would deregister and DELETE the live
+ *  IdentityRegistry.
+ *
+ *  The KEEP set is now DERIVED, not hard-coded: it comes from DEPLOYED.json's
+ *  registries.*.appId — the same single source of truth check-registry-ids.mjs
+ *  reads — so it cannot fall behind a redeploy that updates that file. */
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const deployed = JSON.parse(fs.readFileSync(path.join(HERE, "DEPLOYED.json"), "utf8"));
+const LIVE_IDS = Object.values(deployed.registries).map((r) => Number(r.appId));
+const KEEP = new Set(LIVE_IDS);
+
+// Refuse to run if the e2e config points at a DIFFERENT generation than the one
+// DEPLOYED.json calls live. A config left over from an earlier deployment would
+// otherwise make this treat the live registries as strays and delete them — the
+// exact incident above. cfg.registries is { identity, reputation, validation }.
+if (cfg.registries) {
+  const cfgIds = new Set(Object.values(cfg.registries).map(Number));
+  const disagrees =
+    cfgIds.size !== KEEP.size || [...cfgIds].some((id) => !KEEP.has(id));
+  if (disagrees) {
+    throw new Error(
+      `Refusing to run: the e2e config names registries ${[...cfgIds].sort().join(", ")}, ` +
+      `but DEPLOYED.json says the live set is ${[...KEEP].sort().join(", ")}. ` +
+      `One of them is a stale generation. Reconcile them before reclaiming, or this ` +
+      `would delete an app that is actually live.`
+    );
+  }
+}
 
 const u64 = (n) => {
   const b = Buffer.alloc(8);

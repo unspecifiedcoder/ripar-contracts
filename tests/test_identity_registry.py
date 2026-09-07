@@ -186,14 +186,58 @@ def test_rotation_moves_control_and_keeps_the_id(ctx, registry):
     new = ctx.any.account()
     agent_id = _register(ctx, registry, old, "rotate.example")
 
+    # Two steps now: the owner proposes, and nothing moves until the new address
+    # claims it. Control has NOT moved after the proposal alone.
     with ctx.txn.create_group(active_txn_overrides={"sender": old}):
         registry.rotate_address(agent_id, arc4.Address(new))
+    with ctx.txn.create_group(active_txn_overrides={"sender": new}):
+        assert registry.agent_address(agent_id).native == old
+
+    with ctx.txn.create_group(active_txn_overrides={"sender": new}):
+        registry.claim_address(agent_id)
 
     with ctx.txn.create_group(active_txn_overrides={"sender": new}):
         assert registry.agent_address(agent_id).native == new
         # the reverse index must follow, or the agent becomes unresolvable
         assert registry.resolve_by_address(arc4.Address(new)).native == agent_id.native
         assert registry.resolve_by_address(arc4.Address(old)).native == 0
+
+
+def test_rotation_needs_the_new_address_to_consent(ctx, registry):
+    """The F4 fix: a one-step rotation let an attacker bind their identity onto a
+    victim's address without consent. Now a proposal alone changes nothing, so
+    the victim is never squatted and can still register."""
+    attacker = ctx.any.account()
+    victim = ctx.any.account()
+    bad = _register(ctx, registry, attacker, "scam.example")
+    with ctx.txn.create_group(active_txn_overrides={"sender": attacker}):
+        registry.rotate_address(bad, arc4.Address(victim))
+    with ctx.txn.create_group(active_txn_overrides={"sender": victim}):
+        # the victim is untouched: still unregistered, address still free
+        assert registry.resolve_by_address(arc4.Address(victim)).native == 0
+    assert _register(ctx, registry, victim, "victim.example").native == 2
+
+
+def test_only_the_proposed_address_may_claim(ctx, registry):
+    owner, new, thief = ctx.any.account(), ctx.any.account(), ctx.any.account()
+    aid = _register(ctx, registry, owner, "claimguard.example")
+    with ctx.txn.create_group(active_txn_overrides={"sender": owner}):
+        registry.rotate_address(aid, arc4.Address(new))
+    with pytest.raises(Exception, match="only the proposed address may claim"):
+        with ctx.txn.create_group(active_txn_overrides={"sender": thief}):
+            registry.claim_address(aid)
+
+
+def test_the_owner_can_cancel_a_pending_rotation(ctx, registry):
+    owner, new = ctx.any.account(), ctx.any.account()
+    aid = _register(ctx, registry, owner, "cancel.example")
+    with ctx.txn.create_group(active_txn_overrides={"sender": owner}):
+        registry.rotate_address(aid, arc4.Address(new))
+    with ctx.txn.create_group(active_txn_overrides={"sender": owner}):
+        registry.cancel_rotation(aid)
+    with pytest.raises(Exception, match="no rotation is pending"):
+        with ctx.txn.create_group(active_txn_overrides={"sender": new}):
+            registry.claim_address(aid)
 
 
 def test_only_the_current_address_may_rotate(ctx, registry):

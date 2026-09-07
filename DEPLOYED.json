@@ -140,9 +140,9 @@
       "how": "These are the approval-program sha256[:16] STILL LIVE on 770382913/770382914/770382915. Each hashed identically to byteCode.approval in contracts/artifacts at the time those apps were deployed — but the artifacts have since been rebuilt from the audited source, so they no longer match these."
     },
     "sourceHashPendingDeploy": {
-      "IdentityRegistry": "30393d781804034d",
+      "IdentityRegistry": "81b4260127d8ac3e",
       "ReputationRegistry": "86fe00227823828b",
-      "ValidationRegistry": "8c062d8258a35a70",
+      "ValidationRegistry": "132f0f4b3e9f9913",
       "how": "The approval-program sha256[:16] of the CURRENT committed/audited source in contracts/artifacts. These will become the on-chain hashes once the audited contracts are redeployed; until then no deployed app carries them."
     }
   }

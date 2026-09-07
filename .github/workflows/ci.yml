@@ -90,7 +90,14 @@ jobs:
                                  # src/deployed.ts, whose CONTRACT_METHODS table
                                  # transcribes these signatures from the arc56
                                  # artifact this check reads.
-                                 "rotate_address"},
+                                 "rotate_address",
+                                 # Added by the 2026-09 red-team pass. rotate_address
+                                 # now only PROPOSES a new address (two-step): the
+                                 # proposed address must claim_address to accept it,
+                                 # and the owner can cancel_rotation to withdraw a
+                                 # pending proposal. A one-step rotate let a stolen
+                                 # key move the identity away before the owner noticed.
+                                 "claim_address", "cancel_rotation"},
             "ReputationRegistry": {"bootstrap", "accept_feedback", "get_score", "recent"},
             "ValidationRegistry": {"bootstrap", "opt_in_asset", "post_job", "assign_job",
                                    "submit_result", "validation_response", "fund_job",
@@ -108,7 +115,14 @@ jobs:
                                    # validation_response no longer inner-calls it, and
                                    # reclaim_stranded lets a client recover a VALIDATED
                                    # escrow left stranded by an unpayable worker.
-                                   "record_job_verdict", "reclaim_stranded"},
+                                   "record_job_verdict", "reclaim_stranded",
+                                   # Added by the 2026-09 red-team pass. When BOTH
+                                   # the validator and the fallback judge stay silent,
+                                   # expire_verdict now resolves to SPLIT (status 6):
+                                   # the escrow divides 50/50 into a worker box (es_)
+                                   # and a client box (rf_), claimable by settle_split
+                                   # and claim_split_refund respectively.
+                                   "settle_split", "claim_split_refund"},
           }
 
           # The SIGNATURE, not just the name. An ARC-4 selector is a hash of the
@@ -130,8 +144,14 @@ jobs:
                                    # attributable, and is now called only by
                                    # ValidationRegistry.record_job_verdict.
                                    "record_validation": "record_validation(uint64,uint64,bool)bool"},
-            "ValidationRegistry": {"place_bid": "place_bid(pay,uint64,uint64,uint64,byte[])bool",
-                                   "accept_bid": "accept_bid(uint64,uint64)bool",
+            "ValidationRegistry": {# 2026-09 red-team pass: place_bid gained a
+                                   # trailing fallback_validator_agent_id (the bidder
+                                   # names the fallback judge), and accept_bid gained a
+                                   # trailing expected_price_micro so the client cannot
+                                   # be front-run onto a different price. Both change
+                                   # the selector exactly as a rename would.
+                                   "place_bid": "place_bid(pay,uint64,uint64,uint64,byte[],uint64)bool",
+                                   "accept_bid": "accept_bid(uint64,uint64,uint64)bool",
                                    "fund_job": "fund_job(pay,axfer,uint64)uint64",
                                    "release_escrow": "release_escrow(uint64)uint64",
                                    "record_job_verdict": "record_job_verdict(pay,uint64)bool",

@@ -37,10 +37,13 @@ const other = algosdk.mnemonicToSecretKey(cfg.payer.mnemonic); // the attacker
 const ASSET = cfg.assetId;
 
 // The dispute window is one-shot: `bootstrap` takes it permanently. A 20-second
-// production window lets ANYONE call expire_verdict then release_escrow ~40s
-// after a result is submitted, draining the escrow before the client or a real
-// validator can look at the work. So on a public chain it is not allowed to
-// default and it is not allowed to be short — refuse to start. LocalNet is
+// production window lets ANYONE call expire_verdict ~40s after a result is
+// submitted — which now forces the job to SPLIT (a 50/50 division of the escrow)
+// before the client or a real validator can look at the work, halving the
+// worker's pay by default. (Updated for the 2026-09 red-team pass: expire_verdict
+// used to auto-VALIDATE and release the whole escrow; it now yields SPLIT so
+// neither side wins by silence.) So on a public chain the window is not allowed
+// to default and not allowed to be short — refuse to start. LocalNet is
 // exempt: its blocks are ~25s apart, so this attack suite must use a window of
 // seconds for the expiry paths to be observable inside one run.
 const isLocalNet =
@@ -352,9 +355,15 @@ const postJob = M(
   [{ type: "pay" }, { type: "byte[]" }, { type: "uint64" }, { type: "uint64" }],
   "uint64"
 );
-const assignJob = M("assign_job", [{ type: "uint64" }, { type: "uint64" }], "bool");
+// NOTE: updated for the audit-fix ABI; not yet re-run against a live network.
+// The 2026-09 red-team pass made the judging symmetric. assign_job now names a
+// fallback judge (the trailing uint64 — 0 for none); the assignee consents to it
+// by taking the assignment. validation_response takes a trailing `as_validator`:
+// the agent id the caller is acting as (the named validator, the fallback once
+// the validator's window passes, or 0 when the client judges a no-validator job).
+const assignJob = M("assign_job", [{ type: "uint64" }, { type: "uint64" }, { type: "uint64" }], "bool");
 const submitResult = M("submit_result", [{ type: "pay" }, { type: "uint64" }, { type: "byte[]" }], "bool");
-const validationResponse = M("validation_response", [{ type: "uint64" }, { type: "bool" }], "uint64");
+const validationResponse = M("validation_response", [{ type: "uint64" }, { type: "bool" }, { type: "uint64" }], "uint64");
 const recordJobVerdict = M("record_job_verdict", [{ type: "pay" }, { type: "uint64" }], "bool");
 
 // Sync a decided job's verdict through to the assignee's reputation score. Since
@@ -392,7 +401,8 @@ console.log(`\n  posted job ${jobId} (validator = agent ${clientId})`);
 await call({
   appId: validation,
   method: assignJob,
-  args: [jobId, serverId],
+  // trailing 0 = no fallback judge for this pairing.
+  args: [jobId, serverId, 0],
   boxes: [box(validation, "jb_", u64(jobId))],
 });
 
@@ -430,7 +440,9 @@ await attempt("a stranger cannot mark a job validated", async () => {
   await call({
     appId: validation,
     method: validationResponse,
-    args: [jobId, true],
+    // as_validator = 0: the client attempts to self-judge. A validator was named
+    // and its window has not passed, so client-judging is refused.
+    args: [jobId, true, 0],
     sender: deployer, // the client, but a VALIDATOR was named — so not permitted
     fee: 5000,
     foreignApps: [identity],
@@ -445,7 +457,8 @@ await attempt(
     const r = await call({
       appId: validation,
       method: validationResponse,
-      args: [jobId, true],
+      // as_validator = clientId: `other` controls the named validator and judges.
+      args: [jobId, true, clientId],
       sender: other,
       // NOTE: updated for the audit-fix ABI; not yet re-run against a live
       // network. validation_response now resolves only the caller against
@@ -541,7 +554,7 @@ await attempt("escrow cannot be released before the work passes", async () => {
 });
 
 // Drive job 2 to VALIDATED so release becomes legal.
-await call({ appId: validation, method: assignJob, args: [job2, serverId], boxes: [box(validation, "jb_", u64(job2))] });
+await call({ appId: validation, method: assignJob, args: [job2, serverId, 0], boxes: [box(validation, "jb_", u64(job2))] });
 await call({
   appId: validation, method: submitResult, args: [await mbrPay(deployer, validation, 200_000), job2, new Uint8Array(32).fill(12)],
   fee: 5000, foreignApps: [identity],
@@ -551,7 +564,7 @@ await call({
 // validation_response no longer inner-calls reputation; the score write is the
 // separate record_job_verdict that follows.
 await call({
-  appId: validation, method: validationResponse, args: [job2, true],
+  appId: validation, method: validationResponse, args: [job2, true, clientId],
   sender: other, fee: 5000, foreignApps: [identity],
   boxes: [
     box(validation, "jb_", u64(job2)),
@@ -617,13 +630,25 @@ console.log(
 console.log("\n── bidding ──");
 
 // NOTE: updated for the audit-fix ABI; not yet re-run against a live network.
-// place_bid now leads with a `pay` funding the bd_ bid box.
-const placeBid = M("place_bid", [{ type: "pay" }, { type: "uint64" }, { type: "uint64" }, { type: "uint64" }, { type: "byte[]" }], "bool");
-const acceptBid = M("accept_bid", [{ type: "uint64" }, { type: "uint64" }], "bool");
+// place_bid leads with a `pay` funding the bd_ bid box, AND (2026-09 red-team
+// pass) gained a trailing fallback_validator_agent_id (the BIDDER names the
+// fallback judge — 0 for none); the client consents by accepting the bid.
+// accept_bid gained a trailing expected_price_micro so the client cannot be
+// front-run onto a bid whose price changed under them — pass the bid's own price.
+const placeBid = M("place_bid", [{ type: "pay" }, { type: "uint64" }, { type: "uint64" }, { type: "uint64" }, { type: "byte[]" }, { type: "uint64" }], "bool");
+const acceptBid = M("accept_bid", [{ type: "uint64" }, { type: "uint64" }, { type: "uint64" }], "bool");
 const withdrawBid = M("withdraw_bid", [{ type: "uint64" }, { type: "uint64" }], "bool");
 const releasePartial = M("release_partial", [{ type: "uint64" }, { type: "uint64" }], "uint64");
 const expireJob = M("expire_job", [{ type: "uint64" }], "bool");
+// NOTE: updated for the audit-fix ABI; not yet re-run against a live network.
+// The 2026-09 red-team pass made rotation two-step: rotate_address only PROPOSES
+// a new controlling address (writing a pr_ pending box), and the PROPOSED address
+// must call claim_address to accept it — so an identity can never be shoved onto
+// an address that did not ask for it. cancel_rotation lets the owner withdraw a
+// pending proposal.
 const rotateAddress = M("rotate_address", [{ type: "uint64" }, { type: "address" }], "bool");
+const claimAddress = M("claim_address", [{ type: "uint64" }], "bool");
+const cancelRotation = M("cancel_rotation", [{ type: "uint64" }], "bool");
 
 const bidKey = (job, bidder) => new Uint8Array([...Buffer.from("bd_"), ...u64(job), ...u64(bidder)]);
 const pitch = new Uint8Array(32).fill(21);
@@ -640,7 +665,7 @@ console.log(`  posted job ${job3}`);
 // The client cannot bid on their own job.
 await attempt("the client cannot bid on their own job", async () => {
   await call({
-    appId: validation, method: placeBid, args: [await mbrPay(deployer, validation, 200_000), job3, serverId, 400_000, pitch],
+    appId: validation, method: placeBid, args: [await mbrPay(deployer, validation, 200_000), job3, serverId, 400_000, pitch, 0],
     fee: 5000, foreignApps: [identity],
     boxes: [box(validation, "jb_", u64(job3)), { appIndex: validation, name: bidKey(job3, serverId) }, box(identity, "ag_", u64(serverId))],
   });
@@ -649,7 +674,7 @@ await attempt("the client cannot bid on their own job", async () => {
 // An agent cannot bid on behalf of another.
 await attempt("an agent cannot place a bid for somebody else", async () => {
   await call({
-    appId: validation, method: placeBid, args: [await mbrPay(other, validation, 200_000), job3, serverId, 400_000, pitch],
+    appId: validation, method: placeBid, args: [await mbrPay(other, validation, 200_000), job3, serverId, 400_000, pitch, 0],
     sender: other, fee: 5000, foreignApps: [identity],
     boxes: [box(validation, "jb_", u64(job3)), { appIndex: validation, name: bidKey(job3, serverId) }, box(identity, "ag_", u64(serverId))],
   });
@@ -658,7 +683,7 @@ await attempt("an agent cannot place a bid for somebody else", async () => {
 // Agent 2 (the `other` account) bids for real.
 await attempt("an agent CAN bid on an open job", async () => {
   await call({
-    appId: validation, method: placeBid, args: [await mbrPay(other, validation, 200_000), job3, clientId, 400_000, pitch],
+    appId: validation, method: placeBid, args: [await mbrPay(other, validation, 200_000), job3, clientId, 400_000, pitch, 0],
     sender: other, fee: 5000, foreignApps: [identity],
     boxes: [box(validation, "jb_", u64(job3)), { appIndex: validation, name: bidKey(job3, clientId) }, box(identity, "ag_", u64(clientId))],
   });
@@ -667,7 +692,7 @@ await attempt("an agent CAN bid on an open job", async () => {
 // Only the client accepts.
 await attempt("a stranger cannot accept a bid", async () => {
   await call({
-    appId: validation, method: acceptBid, args: [job3, clientId],
+    appId: validation, method: acceptBid, args: [job3, clientId, 400_000],
     sender: other,
     boxes: [box(validation, "jb_", u64(job3)), { appIndex: validation, name: bidKey(job3, clientId) }],
   });
@@ -675,7 +700,8 @@ await attempt("a stranger cannot accept a bid", async () => {
 
 await attempt("the client CAN accept a bid, and the budget becomes the bid", async () => {
   await call({
-    appId: validation, method: acceptBid, args: [job3, clientId],
+    // expected_price_micro = 400_000, the accepted bid's own price.
+    appId: validation, method: acceptBid, args: [job3, clientId, 400_000],
     boxes: [box(validation, "jb_", u64(job3)), { appIndex: validation, name: bidKey(job3, clientId) }],
   });
   const raw = Buffer.from(
@@ -692,7 +718,7 @@ console.log(
 // Bids close once assigned.
 await attempt("bids close once the job is assigned", async () => {
   await call({
-    appId: validation, method: placeBid, args: [await mbrPay(other, validation, 200_000), job3, clientId, 300_000, pitch],
+    appId: validation, method: placeBid, args: [await mbrPay(other, validation, 200_000), job3, clientId, 300_000, pitch, 0],
     sender: other, fee: 5000, foreignApps: [identity],
     boxes: [box(validation, "jb_", u64(job3)), { appIndex: validation, name: bidKey(job3, clientId) }, box(identity, "ag_", u64(clientId))],
   });
@@ -725,7 +751,7 @@ await call({
 // writes the score. Job 3's assignee is clientId (agent 2), so the verdict lands
 // on that agent's score box.
 await call({
-  appId: validation, method: validationResponse, args: [job3, true],
+  appId: validation, method: validationResponse, args: [job3, true, clientId],
   sender: other, fee: 5000, foreignApps: [identity],
   boxes: [box(validation, "jb_", u64(job3)), box(identity, "ag_", u64(clientId))],
 });
@@ -760,7 +786,7 @@ const job4 = Number(
     boxes: [box(validation, "jb_", u64(4))],
   })).value
 );
-await call({ appId: validation, method: assignJob, args: [job4, serverId], boxes: [box(validation, "jb_", u64(job4))] });
+await call({ appId: validation, method: assignJob, args: [job4, serverId, 0], boxes: [box(validation, "jb_", u64(job4))] });
 
 await attempt("an assigned job cannot expire before its deadline", async () => {
   await call({ appId: validation, method: expireJob, args: [job4], boxes: [box(validation, "jb_", u64(job4))] });
@@ -816,25 +842,64 @@ await attempt("ANYONE may expire an abandoned assignment", async () => {
 console.log("\n── key rotation ──");
 const fresh = algosdk.generateAccount();
 
-await attempt("a stranger cannot rotate an agent's address", async () => {
+// NOTE: updated for the audit-fix ABI; not yet re-run against a live network.
+// Rotation is now two-step (propose + claim). rotate_address writes the pr_
+// pending box; both the propose and the claim reference it below.
+await attempt("a stranger cannot propose a rotation for an agent's address", async () => {
   await call({
     appId: identity, method: rotateAddress, args: [serverId, fresh.addr.toString()],
     sender: other,
-    boxes: [box(identity, "ag_", u64(serverId)), addrBox(identity, "ad_", deployer.addr.toString()), addrBox(identity, "ad_", fresh.addr.toString())],
+    boxes: [box(identity, "ag_", u64(serverId)), box(identity, "pr_", u64(serverId)), addrBox(identity, "ad_", deployer.addr.toString()), addrBox(identity, "ad_", fresh.addr.toString())],
   });
 });
 
-await attempt("rotating to an address that already controls an agent is refused", async () => {
+// Still refused at PROPOSE time: rotate_address rejects a new address that
+// already controls another agent before any pending box is written.
+await attempt("proposing an address that already controls an agent is refused", async () => {
   await call({
     appId: identity, method: rotateAddress, args: [serverId, other.addr.toString()],
-    boxes: [box(identity, "ag_", u64(serverId)), addrBox(identity, "ad_", deployer.addr.toString()), addrBox(identity, "ad_", other.addr.toString())],
+    boxes: [box(identity, "ag_", u64(serverId)), box(identity, "pr_", u64(serverId)), addrBox(identity, "ad_", deployer.addr.toString()), addrBox(identity, "ad_", other.addr.toString())],
   });
 });
 
-await attempt("the owner CAN rotate, and the OLD address stops resolving", async () => {
+// Fund `fresh` up front: consenting is the whole point of the two-step design,
+// so the proposed address must be able to sign its own claim_address (and later
+// propose the rotation back).
+{
+  const sp = await algod.getTransactionParams().do();
+  const fund = algosdk.makePaymentTxnWithSuggestedParamsFromObject({
+    sender: deployer.addr, receiver: fresh.addr, amount: 400_000, suggestedParams: sp,
+  });
+  const { txid } = await algod.sendRawTransaction(fund.signTxn(deployer.sk)).do();
+  await algosdk.waitForConfirmation(algod, txid, 6);
+}
+
+// Step 1 — the owner PROPOSES. Nothing moves yet: the old address still resolves
+// until the proposed address consents.
+await attempt("the owner CAN propose a rotation", async () => {
   await call({
     appId: identity, method: rotateAddress, args: [serverId, fresh.addr.toString()],
-    boxes: [box(identity, "ag_", u64(serverId)), addrBox(identity, "ad_", deployer.addr.toString()), addrBox(identity, "ad_", fresh.addr.toString())],
+    boxes: [box(identity, "ag_", u64(serverId)), box(identity, "pr_", u64(serverId)), addrBox(identity, "ad_", deployer.addr.toString()), addrBox(identity, "ad_", fresh.addr.toString())],
+  });
+}, false);
+
+// A stranger cannot claim a rotation that was proposed to someone else — this is
+// the consent gate that stops an identity being shoved onto an address.
+await attempt("only the proposed address may claim the rotation", async () => {
+  await call({
+    appId: identity, method: claimAddress, args: [serverId],
+    sender: other,
+    boxes: [box(identity, "ag_", u64(serverId)), box(identity, "pr_", u64(serverId)), addrBox(identity, "ad_", deployer.addr.toString()), addrBox(identity, "ad_", other.addr.toString())],
+  });
+});
+
+// Step 2 — the proposed address CLAIMS. Only now does control move and the OLD
+// reverse index disappear.
+await attempt("the proposed address CAN claim, and the OLD address stops resolving", async () => {
+  await call({
+    appId: identity, method: claimAddress, args: [serverId],
+    sender: fresh,
+    boxes: [box(identity, "ag_", u64(serverId)), box(identity, "pr_", u64(serverId)), addrBox(identity, "ad_", deployer.addr.toString()), addrBox(identity, "ad_", fresh.addr.toString())],
   });
   const old = await algod
     .getApplicationBoxByName(identity, addrBox(identity, "ad_", deployer.addr.toString()).name).do()
@@ -851,21 +916,41 @@ console.log(
   `  ${results["rotation removes the old reverse index"] ? "PASS" : "FAIL"}  rotation removes the old reverse index`
 );
 
-// Put it back, so the rest of the system keeps working.
+// Put it back, two-step: `fresh` (which now controls the agent) proposes the
+// deployer, and the deployer claims it.
 {
-  const sp = await algod.getTransactionParams().do();
-  const fund = algosdk.makePaymentTxnWithSuggestedParamsFromObject({
-    sender: deployer.addr, receiver: fresh.addr, amount: 300_000, suggestedParams: sp,
-  });
-  const { txid } = await algod.sendRawTransaction(fund.signTxn(deployer.sk)).do();
-  await algosdk.waitForConfirmation(algod, txid, 6);
   await call({
     appId: identity, method: rotateAddress, args: [serverId, deployer.addr.toString()],
     sender: fresh,
-    boxes: [box(identity, "ag_", u64(serverId)), addrBox(identity, "ad_", fresh.addr.toString()), addrBox(identity, "ad_", deployer.addr.toString())],
+    boxes: [box(identity, "ag_", u64(serverId)), box(identity, "pr_", u64(serverId)), addrBox(identity, "ad_", fresh.addr.toString()), addrBox(identity, "ad_", deployer.addr.toString())],
+  });
+  await call({
+    appId: identity, method: claimAddress, args: [serverId],
+    boxes: [box(identity, "ag_", u64(serverId)), box(identity, "pr_", u64(serverId)), addrBox(identity, "ad_", fresh.addr.toString()), addrBox(identity, "ad_", deployer.addr.toString())],
   });
   console.log("  rotated back to the deployer");
 }
+
+// cancel_rotation: the owner may withdraw a pending proposal before it is
+// claimed. Propose to `fresh` once more, then cancel, and check no pending
+// rotation survives.
+await attempt("the owner CAN cancel a pending rotation", async () => {
+  await call({
+    appId: identity, method: rotateAddress, args: [serverId, fresh.addr.toString()],
+    boxes: [box(identity, "ag_", u64(serverId)), box(identity, "pr_", u64(serverId)), addrBox(identity, "ad_", deployer.addr.toString()), addrBox(identity, "ad_", fresh.addr.toString())],
+  });
+  await call({
+    appId: identity, method: cancelRotation, args: [serverId],
+    boxes: [box(identity, "ag_", u64(serverId)), box(identity, "pr_", u64(serverId))],
+  });
+  const pending = await algod
+    .getApplicationBoxByName(identity, box(identity, "pr_", u64(serverId)).name).do()
+    .then(() => true).catch(() => false);
+  results["cancel_rotation withdraws a pending proposal"] = !pending;
+}, false);
+console.log(
+  `  ${results["cancel_rotation withdraws a pending proposal"] ? "PASS" : "FAIL"}  cancel_rotation withdraws a pending proposal`
+);
 
 /* ── the verdict has to reach the score ────────────────────────────────── */
 console.log("\n── does a verdict reach the score? ──");

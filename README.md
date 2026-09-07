@@ -101,9 +101,9 @@ bytecode that hashes identically to the artifacts committed in
 
 | contract | approval sha256[:16] |
 | --- | --- |
-| IdentityRegistry | `30393d781804034d` |
+| IdentityRegistry | `81b4260127d8ac3e` |
 | ReputationRegistry | `86fe00227823828b` |
-| ValidationRegistry | `8c062d8258a35a70` |
+| ValidationRegistry | `132f0f4b3e9f9913` |
 
 These are the hashes of the **current, audited** source. The apps live on TestNet
 (`770382913` / `770382914` / `770382915`) were built from the PRE-audit source and
@@ -187,6 +187,28 @@ app ids carry them.
   `DEPLOYED.json` instead of a hard-coded id that had gone stale (and would have
   deleted the live registry), and the deploy scripts refuse to bootstrap a
   sub-hour dispute window on a public network.
+
+**The escrow judging was redesigned, because the first fix was itself
+exploitable.** A red-team pass on the fix above found it had only moved the free
+option, not closed it: giving the client a fallback judge let the client sit on
+delivered work and reject it for nothing, freezing a paid worker exactly as an
+absent validator would. It was replaced with a symmetric design. Whoever
+initiates the pairing names a fallback judge — the client in `assign_job`, the
+bidder in `place_bid` — and the other side consents by committing to it on
+accept. `validation_response` now takes an `as_validator` argument naming the id
+the caller is acting as (the validator, or the fallback once the validator's
+window has passed). If **both** judges stay silent, `expire_verdict` no longer
+resolves to a full release for either party: the job moves to a new `SPLIT`
+status (6) that divides the escrow 50/50 into two boxes — the worker's half in
+`es_`, the client's half in `rf_` — claimed by `settle_split` and
+`claim_split_refund`. Neither side wins by default.
+
+One residual is worth stating plainly: a worker can still route the fallback to a
+second agent it controls, and on chain that is indistinguishable from an
+independent judge. That is why the fallback is a **visible field** named at
+pairing time rather than a hidden default, and why running a protocol arbiter as
+the fallback is a deployment-policy option rather than something the contract can
+enforce.
 
 ## Deploying
 

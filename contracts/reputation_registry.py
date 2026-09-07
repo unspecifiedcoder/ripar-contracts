@@ -56,6 +56,13 @@ class ReputationRegistry(ARC4Contract):
         # verdict. Set separately from bootstrap because validation is deployed
         # after this contract and cannot name itself before it exists.
         self.validation_app = UInt64(0)
+        # One box per job whose verdict has been written to a score, so a verdict
+        # can be synced exactly once. record_validation is no longer inside
+        # validation_response (an unfunded score box there could revert the whole
+        # verdict and let expire_verdict force a pass); it is now driven by a
+        # separate, funded, retryable call, and this set stops that call being
+        # replayed to double-count validated/disputed.
+        self.recorded_jobs = BoxMap(UInt64, bool, key_prefix=b"rv_")
         # There is deliberately no pd_ ledger of counted payments. One existed
         # and was never written to, so was_counted() answered 0 for every
         # payment that had in fact been counted — a reader integrating against
@@ -111,6 +118,7 @@ class ReputationRegistry(ARC4Contract):
     @arc4.abimethod
     def accept_feedback(
         self,
+        mbr: gtxn.PaymentTransaction,
         payment: gtxn.AssetTransferTransaction,
         server_agent_id: arc4.UInt64,
         client_agent_id: arc4.UInt64,
@@ -181,12 +189,24 @@ class ReputationRegistry(ARC4Contract):
         # — the consensus layer already provides exactly the guarantee the box
         # was trying to reimplement, and provides it better.
 
+        app = Global.current_application_address
+        mbr_before = app.min_balance
+
         sid = server_agent_id.native
         s = self._touch(sid)
         s.jobs_paid = arc4.UInt64(s.jobs_paid.native + 1)
         s.volume_micro = arc4.UInt64(s.volume_micro.native + payment.asset_amount)
         s.last_at = arc4.UInt64(Global.latest_timestamp)
         self.scores[sid] = s.copy()
+
+        # A first credit for an agent creates its score box, whose minimum
+        # balance is charged to THIS app. Have the caller cover that growth so a
+        # stranger cannot drain the app's own balance one score box at a time.
+        assert mbr.receiver == app, "storage payment must be sent to this app"
+        assert mbr.sender == Txn.sender, "you must pay for the storage you create"
+        assert (
+            mbr.amount >= app.min_balance - mbr_before
+        ), "payment must cover the score box this credit may add"
 
         return arc4.UInt64(s.jobs_paid.native)
 
@@ -222,23 +242,28 @@ class ReputationRegistry(ARC4Contract):
         return arc4.Bool(Global.latest_timestamp <= last + window_secs.native)
 
     @arc4.abimethod
-    def record_validation(self, server_agent_id: arc4.UInt64, passed: arc4.Bool) -> arc4.Bool:
+    def record_validation(
+        self, job_id: arc4.UInt64, server_agent_id: arc4.UInt64, passed: arc4.Bool
+    ) -> arc4.Bool:
         """Record a verdict against an agent's score. ValidationRegistry only.
 
-        The docstring used to say "called by the Validation Registry" and that
-        was simply untrue on two counts: nothing called it, so `validated` and
-        `disputed` sat at zero while jobs were being judged, and ANY address
-        could have called it, so the two fields were writable by anyone who
-        wanted a clean record.
-
-        Both are closed here. validation_response now makes this call, and the
-        caller is checked against the app id set at deployment — an address
+        The caller is checked against the app id set at deployment — an address
         calling directly has a caller_application_id of 0 and is refused.
+
+        `job_id` makes the write idempotent. The verdict is no longer recorded
+        inside validation_response (an unfunded score box there could revert the
+        whole call and let expire_verdict force a pass); it is driven by a
+        separate, funded, retryable ValidationRegistry call, so this must reject
+        a second recording of the same job or the counters could be inflated by
+        replaying it.
         """
         assert self.validation_app != 0, "no validation app is set, so no verdict can be trusted"
         assert (
             Global.caller_application_id == self.validation_app
         ), "only the ValidationRegistry may record a verdict"
+        jid = job_id.native
+        assert jid not in self.recorded_jobs, "this job's verdict was already recorded"
+        self.recorded_jobs[jid] = True
         sid = server_agent_id.native
         s = self._touch(sid)
         if passed.native:

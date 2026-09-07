@@ -53,6 +53,33 @@ const other = cfg.payer?.mnemonic
   ? algosdk.mnemonicToSecretKey(cfg.payer.mnemonic)
   : null; // only the attack suite needed a second account; deploying does not
 const ASSET = cfg.assetId;
+
+// The dispute window is one-shot: `bootstrap` takes it permanently. A 20-second
+// production window lets ANYONE call expire_verdict then release_escrow ~40s
+// after a result is submitted, draining the escrow before the client or a real
+// validator can look at the work. So on a public chain it is not allowed to
+// default and it is not allowed to be short — refuse to start, the same way this
+// script refuses to start without an explicit ALGOD_URL. LocalNet is exempt: its
+// blocks are ~25s apart, so the attack suite must use a window of seconds.
+const isLocalNet =
+  /localhost|127\.0\.0\.1|:4001\b/.test(process.env.ALGOD_URL) ||
+  /local/i.test(NETWORK);
+if (!isLocalNet) {
+  if (cfg.disputeWindowSecs == null) {
+    throw new Error(
+      `disputeWindowSecs is missing from ${CONFIG_NAME}. On ${NETWORK} it must be set ` +
+      `explicitly (MainNet uses 259200 = 72h); a defaulted 20s window lets anyone drain ` +
+      `escrow ~40s after a result is submitted.`
+    );
+  }
+  if (Number(cfg.disputeWindowSecs) < 3600) {
+    throw new Error(
+      `disputeWindowSecs is ${cfg.disputeWindowSecs}s on ${NETWORK}, below the 3600s (1h) ` +
+      `floor. bootstrap takes it permanently, so a short window cannot be corrected — only ` +
+      `redeployed. MainNet is configured for 259200 (72h).`
+    );
+  }
+}
 const DISPUTE_WINDOW = Number(cfg.disputeWindowSecs ?? 20);
 
 const art = (name) =>

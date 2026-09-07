@@ -101,20 +101,28 @@ bytecode that hashes identically to the artifacts committed in
 
 | contract | approval sha256[:16] |
 | --- | --- |
-| IdentityRegistry | `b14ffe7001b39a89` |
-| ReputationRegistry | `14d3857c38bcf76d` |
-| ValidationRegistry | `18009c6c862a295b` |
+| IdentityRegistry | `30393d781804034d` |
+| ReputationRegistry | `86fe00227823828b` |
+| ValidationRegistry | `8c062d8258a35a70` |
+
+These are the hashes of the **current, audited** source. The apps live on TestNet
+(`770382913` / `770382914` / `770382915`) were built from the PRE-audit source and
+hash `b14ffe7001b39a89` / `14d3857c38bcf76d` / `18009c6c862a295b` — so the committed
+contracts are now **ahead of what is deployed and need redeploying** before those
+app ids carry the audited logic.
 
 ```bash
 python -m puyapy contracts/*.py --out-dir "$(pwd)/build"
 # then compare byteCode.approval in build/*.arc56.json against contracts/artifacts/
 ```
 
-The registries listed above have been checked this way and **match**: each
-deployed approval program hashes identically to its artifact.
+As of the 2026-09 audit the deployed registries **no longer match** the committed
+source: `770382913` / `770382914` / `770382915` were built before the audit, and
+the fixes below changed both the ABI and the approval programs. They still answer
+reads with their pre-audit behaviour until a redeploy replaces them.
 
 That matters because a deployed app which no longer matches its source is not
-something you can detect by reading either one. The previous generation —
+something you can detect by reading either one. The generation before them —
 `769444119` / `769444120` / `769444121` — is in exactly that state. It predates
 the audit below, its ValidationRegistry hashes `9d7797273fa2ba16` rather than
 `18009c6c862a295b`, and the contract declares no `UpdateApplication`, so it
@@ -149,6 +157,36 @@ The fee mechanism had **zero test coverage** before this. It now has ten tests
 covering creator-only, one-shot, the 250 bps ceiling at its boundary, zero-fee
 and zero-address rejection, the safe default, and the flooring arithmetic down
 to dust amounts. The suite went from 33 to 43.
+
+## 2026-09 audit
+
+A second, broader audit followed the fee work. Its fixes are in the source these
+artifacts are built from, so **the committed contracts are ahead of the deployed
+`770382913` / `770382914` / `770382915` apps and need redeploying** before those
+app ids carry them.
+
+- **The caller funds box storage now.** Creating an agent, a job, a bid or an
+  escrow used to draw the box minimum balance from the *app* account. One
+  registration against a drained app account bricked the registry permanently —
+  a DoS one write from full. Every box-creating method now takes a leading
+  payment and the caller funds their own box.
+- **The verdict write is decoupled from `validation_response`.** Judging a job no
+  longer inner-calls the reputation registry, so a starved or wedged reputation
+  app can no longer make a valid verdict fail. The score is synced separately by
+  `record_job_verdict`, which anyone can fund and call once a job is decided.
+- **Escrow is capped at the budget.** Funding a job with more than the agreed
+  budget no longer over-escrows; the excess is refunded to the client.
+- **Domains must be canonical.** A domain is accepted only in its canonical form,
+  so the same name cannot be registered twice under different spellings.
+- **A client can reclaim a stranded escrow.** If a job is VALIDATED but the worker
+  cannot be paid, the client can `reclaim_stranded` after four dispute windows
+  rather than losing the escrow forever.
+- **Refunds no longer pay a protocol fee.** The fee is taken only on a real
+  payout to a worker; a `refund_escrow` back to the client is fee-free.
+- **The ops scripts were fixed too.** `reclaim.mjs` now derives its keep-set from
+  `DEPLOYED.json` instead of a hard-coded id that had gone stale (and would have
+  deleted the live registry), and the deploy scripts refuse to bootstrap a
+  sub-hour dispute window on a public network.
 
 ## Deploying
 

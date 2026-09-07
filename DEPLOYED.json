@@ -31,25 +31,27 @@
         "jobs": "jb_"
       },
       "bootstrappedTo": {
-        "identityApp": 769444119,
+        "identityApp": 770382913,
         "escrowAsset": 10458941,
-        "disputeWindowSecs": 20,
-        "reputationApp": 769444120
+        "disputeWindowSecs": 300,
+        "reputationApp": 770382914,
+        "note": "Corrected 2026-09: these were stale, naming the superseded 769444119/769444120 generation and a 20s window. The values here are the live chain values bootstrapped into 770382915 — identity 770382913, reputation 770382914, dispute_window 300."
       },
       "note": "submit_result and validation_response both resolve the caller against the IdentityRegistry by inner call. Only the assigned agent may submit; only the named validator may judge, or the client when no validator was named.",
       "adds": "Real escrow. fund_job takes the transfer as a group transaction and the app account holds the asset; release_escrow pays the assignee on a passing verdict; refund_escrow returns it on a failed or cancelled one. After the dispute window ANYONE may release, because a validator who never returns would otherwise freeze the worker's money for good. Plus set_validator (client-only, open-only), opt_in_asset, get_escrow, and a delete handler. validation_response now writes the verdict through to the score by inner call. Before this, Score.validated and Score.disputed sat at zero while jobs read VALIDATED, and a reader comparing the two numbers had no way to tell which was wrong."
     }
   },
   "agents": {
+    "staleAddressesNote": "Corrected 2026-09: the addresses below are from a PREVIOUS generation and no longer match what is registered on the live 770382913 IdentityRegistry. The live agent 1 address is the deployer/creator, NGVUO43AXJJ2RZGYUCUKWAYAZZA6YPO5HJ6PCM6VJ6CM7KUTRM75HO3OCU (the top-level `deployer`). Do not read the per-agent `address` fields below as live; they are kept for history.",
     "1": {
       "domain": "ripar-agent.vercel.app",
       "address": "KBDRZK3BV2YFJJAVV3S5XQYDWU4RDDI6EDXXKMG3O4AEVPEDCETDKEISKQ",
-      "note": "The live agent at api.ripar.io. new_agent takes the owner from Txn.sender, so this is the same account the agent's manifest names as payTo \u2014 which is what makes the A2A card's identity claim checkable rather than merely asserted."
+      "note": "STALE address from a previous generation. new_agent takes the owner from Txn.sender, so on the live registry agent 1 is owned by the deployer/creator (NGVUO4...), not this address. Kept for history."
     },
     "2": {
       "domain": "client.ripar.io",
       "address": "B2DGXU2QSRHXNZJMP5FFFU77W5NUMZTZ3X3MSO3PJC4ZQ75CSDL5EKULI4",
-      "note": "The paying side, used as the attacker in deploy-v2.mjs's negative tests."
+      "note": "STALE address from a previous generation. The paying side, used as the attacker in deploy-v2.mjs's negative tests. Kept for history."
     }
   },
   "whatTheseReplaced": {
@@ -100,7 +102,7 @@
     "result": "5/5 on 2026-08-04",
     "what": "Deploys a throwaway registry, registers an agent, deregisters it, then deletes the app \u2014 checking the minimum balance returns to exactly where it started at each step. App MBR is 0.1 ALGO base PLUS per-schema cost (0.414 for this schema), so the figure is not a constant."
   },
-  "READ_THIS_FIRST": "The contracts in contracts/ are AHEAD of what is deployed. Ten features were added (key rotation, bidding, milestone release, job expiry, protocol fee) and they compile, but they are NOT on chain: the deployer is 0.9 ALGO short. See notDeployed. The app ids below are the PREVIOUS generation and are what every other repo reads.",
+  "READ_THIS_FIRST": "The contracts in contracts/ now contain the 2026-09 security-audit fixes and DO NOT match the deployed apps 770382913 / 770382914 / 770382915. The audit changed the ABI (box-creating methods — new_agent, accept_feedback, post_job, submit_result, fund_job, place_bid — now take a leading mbr payment so the caller funds box storage; record_job_verdict and reclaim_stranded were added; record_validation gained a leading job_id and validation_response no longer inner-calls reputation) and therefore the approval programs. A REDEPLOY is required before any repo can use the audited logic. Until then the 770-series apps stay live and answer reads with PRE-audit behaviour. The committed-source hashes are verifiedAgainstSource.sourceHashPendingDeploy; the hashes still live on chain are verifiedAgainstSource.liveOnChain.",
   "notDeployed": {
     "features": [
       "IdentityRegistry.rotate_address \u2014 move an identity to a new controlling address. Without it a compromised or lost key is terminal: new_agent asserts one identity per address, so the owner can neither re-register nor recover, and the id plus every score and job referencing it is stranded with a key somebody else may hold.",
@@ -130,9 +132,18 @@
   },
   "keyStorage": "~/.ripar (dir 0700, files 0600) via config-path.mjs. NOT /tmp \u2014 that is what killed both earlier deployments.",
   "verifiedAgainstSource": {
-    "IdentityRegistry": "b14ffe7001b39a89",
-    "ReputationRegistry": "14d3857c38bcf76d",
-    "ValidationRegistry": "18009c6c862a295b",
-    "how": "sha256 of the on-chain approval program equals sha256 of byteCode.approval in contracts/artifacts, which reproduces from contracts/*.py."
+    "note": "As of the 2026-09 audit the committed source NO LONGER matches the deployed 770382913/770382914/770382915 apps. The audit changed the ABI (box-creating methods take a leading mbr payment; record_job_verdict and reclaim_stranded were added) and therefore the approval programs. A redeploy is required before the deployed apps carry the audited logic.",
+    "liveOnChain": {
+      "IdentityRegistry": "b14ffe7001b39a89",
+      "ReputationRegistry": "14d3857c38bcf76d",
+      "ValidationRegistry": "18009c6c862a295b",
+      "how": "These are the approval-program sha256[:16] STILL LIVE on 770382913/770382914/770382915. Each hashed identically to byteCode.approval in contracts/artifacts at the time those apps were deployed — but the artifacts have since been rebuilt from the audited source, so they no longer match these."
+    },
+    "sourceHashPendingDeploy": {
+      "IdentityRegistry": "30393d781804034d",
+      "ReputationRegistry": "86fe00227823828b",
+      "ValidationRegistry": "8c062d8258a35a70",
+      "how": "The approval-program sha256[:16] of the CURRENT committed/audited source in contracts/artifacts. These will become the on-chain hashes once the audited contracts are redeployed; until then no deployed app carries them."
+    }
   }
 }

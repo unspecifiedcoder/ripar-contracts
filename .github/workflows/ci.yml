@@ -102,7 +102,13 @@ jobs:
                                    # built against these exact names, so
                                    # renaming one here breaks a shipped tool.
                                    "place_bid", "withdraw_bid", "accept_bid", "get_bid",
-                                   "release_partial", "expire_job", "set_fee"},
+                                   "release_partial", "expire_job", "set_fee",
+                                   # Added by the 2026-09 audit fix. record_job_verdict
+                                   # syncs a decided job's verdict to reputation now that
+                                   # validation_response no longer inner-calls it, and
+                                   # reclaim_stranded lets a client recover a VALIDATED
+                                   # escrow left stranded by an unpayable worker.
+                                   "record_job_verdict", "reclaim_stranded"},
           }
 
           # The SIGNATURE, not just the name. An ARC-4 selector is a hash of the
@@ -110,13 +116,26 @@ jobs:
           # breaking as renaming the method and exactly as invisible: the router
           # simply stops matching. ripar-skills derives its selectors from these
           # strings, so a drift here is a tool composing calls nothing answers.
+          #
+          # The 2026-09 audit added a leading `pay` argument to every box-creating
+          # method — the caller funds the box MBR — which changes the selector of
+          # each one exactly as a rename would, so the new strings are pinned here.
           signatures = {
             "IdentityRegistry": {"rotate_address": "rotate_address(uint64,address)bool",
-                                 "agent_address": "agent_address(uint64)address"},
-            "ValidationRegistry": {"place_bid": "place_bid(uint64,uint64,uint64,byte[])bool",
+                                 "agent_address": "agent_address(uint64)address",
+                                 # Now caller-funded: leading pay.
+                                 "new_agent": "new_agent(pay,string)uint64"},
+            "ReputationRegistry": {"accept_feedback": "accept_feedback(pay,axfer,uint64,uint64)uint64",
+                                   # Gained a leading job_id so the verdict is
+                                   # attributable, and is now called only by
+                                   # ValidationRegistry.record_job_verdict.
+                                   "record_validation": "record_validation(uint64,uint64,bool)bool"},
+            "ValidationRegistry": {"place_bid": "place_bid(pay,uint64,uint64,uint64,byte[])bool",
                                    "accept_bid": "accept_bid(uint64,uint64)bool",
-                                   "fund_job": "fund_job(axfer,uint64)uint64",
-                                   "release_escrow": "release_escrow(uint64)uint64"},
+                                   "fund_job": "fund_job(pay,axfer,uint64)uint64",
+                                   "release_escrow": "release_escrow(uint64)uint64",
+                                   "record_job_verdict": "record_job_verdict(pay,uint64)bool",
+                                   "reclaim_stranded": "reclaim_stranded(uint64)uint64"},
           }
 
           bad = False

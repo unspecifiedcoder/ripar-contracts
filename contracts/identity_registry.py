@@ -49,6 +49,10 @@ class IdentityRegistry(ARC4Contract):
         self.agents = BoxMap(UInt64, AgentInfo, key_prefix=b"ag_")
         self.by_domain = BoxMap(String, UInt64, key_prefix=b"dm_")
         self.by_address = BoxMap(Account, UInt64, key_prefix=b"ad_")
+        # A proposed but unclaimed rotation: agent id -> the address invited to
+        # take control. Nothing moves until that address claims it, so an identity
+        # can never be pushed onto someone who did not ask for it.
+        self.pending = BoxMap(UInt64, Account, key_prefix=b"pr_")
 
     @subroutine
     def _now(self) -> UInt64:
@@ -177,22 +181,19 @@ class IdentityRegistry(ARC4Contract):
 
     @arc4.abimethod
     def rotate_address(self, agent_id: arc4.UInt64, new_address: arc4.Address) -> arc4.Bool:
-        """Move an identity to a new controlling address. Current owner only.
+        """PROPOSE a new controlling address. Current owner only; nothing moves yet.
 
-        Without this, a compromised or lost key is terminal. new_agent asserts
-        one identity per address, so the owner cannot re-register, and the id —
-        along with every score and job that references it — is stranded with a
-        key somebody else may hold. An identity you cannot move is an identity
-        you cannot secure.
+        Without a way to move an identity, a compromised or lost key is terminal:
+        new_agent asserts one identity per address, so the owner cannot
+        re-register, and the id — with every score and job that references it — is
+        stranded with a key somebody else may hold.
 
-        The reverse index moves with it, or the OLD address would keep
-        resolving to this agent forever and a caller checking "does the address
-        the card asks me to pay match the registry" would still get a match on
-        the compromised key.
-
-        The new address must not already be registered, and must differ from
-        the current one — a rotation to yourself is a fee for nothing, and
-        silently succeeding would hide a typo.
+        But a one-step rotation let an attacker BIND their own identity onto a
+        stranger's address without consent: register scam.example, rotate it onto
+        a victim's payout address, and now resolve_by_address(victim) returns the
+        attacker's record and the victim cannot register their own. So rotation is
+        two steps: this proposes, and claim_address lets the proposed address
+        accept. An address can never be handed an identity it did not ask for.
         """
         aid = agent_id.native
         assert aid in self.agents, "unknown agent"
@@ -204,11 +205,39 @@ class IdentityRegistry(ARC4Contract):
         assert new_addr != info.agent_address.native, "that is already the controlling address"
         assert new_addr not in self.by_address, "the new address already controls another agent"
 
+        self.pending[aid] = new_addr
+        return arc4.Bool(True)  # noqa: FBT003
+
+    @arc4.abimethod
+    def claim_address(self, agent_id: arc4.UInt64) -> arc4.Bool:
+        """Accept a proposed rotation. Only the proposed address may call this,
+        which is what turns a rotation into consent rather than a shove."""
+        aid = agent_id.native
+        assert aid in self.agents, "unknown agent"
+        assert aid in self.pending, "no rotation is pending"
+        assert self.pending[aid] == Txn.sender, "only the proposed address may claim"
+        assert Txn.sender not in self.by_address, "the new address already controls another agent"
+
+        info = self.agents[aid].copy()
+        # The reverse index moves with control, or the OLD address would keep
+        # resolving to this agent and a payer checking "does the card's address
+        # match the registry" would still match a key that no longer controls it.
         del self.by_address[info.agent_address.native]
-        info.agent_address = new_address
+        info.agent_address = arc4.Address(Txn.sender)
         info.updated_at = arc4.UInt64(self._now())
         self.agents[aid] = info.copy()
-        self.by_address[new_addr] = aid
+        self.by_address[Txn.sender] = aid
+        del self.pending[aid]
+        return arc4.Bool(True)  # noqa: FBT003
+
+    @arc4.abimethod
+    def cancel_rotation(self, agent_id: arc4.UInt64) -> arc4.Bool:
+        """Withdraw a proposed rotation. Current owner only."""
+        aid = agent_id.native
+        assert aid in self.agents, "unknown agent"
+        assert self.agents[aid].agent_address.native == Txn.sender, "only the agent may cancel"
+        assert aid in self.pending, "no rotation is pending"
+        del self.pending[aid]
         return arc4.Bool(True)  # noqa: FBT003
 
     @arc4.abimethod
@@ -236,9 +265,12 @@ class IdentityRegistry(ARC4Contract):
         del self.by_domain[info.agent_domain.native]
         del self.by_address[info.agent_address.native]
         del self.agents[aid]
+        # A proposed-but-unclaimed rotation would otherwise outlive the agent.
+        if aid in self.pending:
+            del self.pending[aid]
 
-        # Return the storage deposit new_agent took. The three boxes are gone,
-        # so min_balance has dropped by exactly what registration paid in.
+        # Return the storage deposit new_agent took. The boxes are gone, so
+        # min_balance has dropped by what registration (and any pending) held.
         freed = mbr_before - app.min_balance
         if freed > 0:
             itxn.Payment(receiver=Txn.sender, amount=freed, fee=0).submit()

@@ -122,7 +122,10 @@ jobs:
                                    # the escrow divides 50/50 into a worker box (es_)
                                    # and a client box (rf_), claimable by settle_split
                                    # and claim_split_refund respectively.
-                                   "settle_split", "claim_split_refund"},
+                                   "settle_split", "claim_split_refund",
+                                   # Optional creator-set protocol arbiter (the
+                                   # follow-up that closes the puppet-fallback residual).
+                                   "set_arbiter", "get_arbiter"},
           }
 
           # The SIGNATURE, not just the name. An ARC-4 selector is a hash of the

@@ -158,6 +158,16 @@ class ValidationRegistry(ARC4Contract):
         self.fee_bps = UInt64(0)
         self.treasury = Global.zero_address
 
+        # Optional protocol arbiter: a creator-set agent that acts as the fallback
+        # judge for EVERY job, superseding any party-named fallback. Zero (the
+        # default) means none, and jobs use their party-named fallback plus the
+        # trustless SPLIT backstop. Setting one closes the residual that a worker
+        # could name a second agent it controls as its own fallback: the arbiter,
+        # not a party, is then the second judge. It is a trusted role — a creator
+        # who installs a colluding arbiter can decide silent-validator jobs — so
+        # it is off by default and named where anyone can read it.
+        self.arbiter_agent_id = UInt64(0)
+
     @arc4.abimethod
     def bootstrap(
         self,
@@ -360,15 +370,24 @@ class ValidationRegistry(ARC4Contract):
             primary_silent = (
                 Global.latest_timestamp > j.updated_at.native + self.dispute_window
             )
-            is_primary = as_validator == j.validator_agent_id
+            # The second judge is the creator-set arbiter if one exists, otherwise
+            # the fallback named at pairing time. When an arbiter is set it
+            # supersedes any party-named fallback, so a worker's own puppet
+            # fallback can never act — the arbiter, a trusted independent judge,
+            # does. A job that named a fallback before an arbiter was set has that
+            # fallback quietly overridden here.
+            effective_fallback = j.fallback_validator_agent_id.native
+            if self.arbiter_agent_id > 0:
+                effective_fallback = self.arbiter_agent_id
+            is_primary = as_validator.native == j.validator_agent_id.native
             is_fallback = (
                 primary_silent
-                and j.fallback_validator_agent_id.native > 0
-                and as_validator == j.fallback_validator_agent_id
+                and effective_fallback > 0
+                and as_validator.native == effective_fallback
             )
             assert (
                 is_primary or is_fallback
-            ), "only the named validator may judge, or the fallback once the validator's window has passed"
+            ), "only the named validator may judge, or the fallback/arbiter once the validator's window has passed"
             assert Txn.sender == self._agent_address(as_validator), "you do not control that validator"
         else:
             assert j.client.native == Txn.sender, "only the client may judge a job with no validator"
@@ -1064,6 +1083,33 @@ class ValidationRegistry(ARC4Contract):
         self.fee_bps = fee_bps.native
         self.treasury = treasury.native
         return arc4.Bool(True)  # noqa: FBT003
+
+    @arc4.abimethod
+    def set_arbiter(self, arbiter_agent_id: arc4.UInt64) -> arc4.Bool:
+        """Set (or clear, with 0) the protocol arbiter. Creator only.
+
+        The arbiter is the fallback judge for every job, superseding any
+        party-named fallback — see the field's comment. It is deliberately NOT
+        one-shot: an arbiter key can be lost or need rotating, and a judge is not
+        a fee, so the creator may change it. That it can be changed is exactly why
+        it is a trusted role, stated plainly: a creator is assumed honest here,
+        and a deployment that cannot make that assumption should leave it at 0 and
+        rely on the party-named fallback and the SPLIT backstop instead.
+
+        The arbiter must be a registered agent (so it resolves to an address);
+        clearing it back to 0 is always allowed.
+        """
+        assert Txn.sender == Global.creator_address, "only the creator may set the arbiter"
+        if arbiter_agent_id.native > 0:
+            # Resolve it now so a typo cannot install an unjudgeable arbiter.
+            self._agent_address(arbiter_agent_id)
+        self.arbiter_agent_id = arbiter_agent_id.native
+        return arc4.Bool(True)  # noqa: FBT003
+
+    @arc4.abimethod(readonly=True)
+    def get_arbiter(self) -> arc4.UInt64:
+        """The protocol arbiter agent id, or 0 if none is set."""
+        return arc4.UInt64(self.arbiter_agent_id)
 
     @arc4.abimethod
     def cancel_job(self, job_id: arc4.UInt64) -> arc4.Bool:

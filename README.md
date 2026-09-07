@@ -103,7 +103,7 @@ bytecode that hashes identically to the artifacts committed in
 | --- | --- |
 | IdentityRegistry | `81b4260127d8ac3e` |
 | ReputationRegistry | `86fe00227823828b` |
-| ValidationRegistry | `132f0f4b3e9f9913` |
+| ValidationRegistry | `b29f2d040a1707b4` |
 
 These are the hashes of the **current, audited** source. The apps live on TestNet
 (`770382913` / `770382914` / `770382915`) were built from the PRE-audit source and
@@ -206,9 +206,18 @@ status (6) that divides the escrow 50/50 into two boxes — the worker's half in
 One residual is worth stating plainly: a worker can still route the fallback to a
 second agent it controls, and on chain that is indistinguishable from an
 independent judge. That is why the fallback is a **visible field** named at
-pairing time rather than a hidden default, and why running a protocol arbiter as
-the fallback is a deployment-policy option rather than something the contract can
-enforce.
+pairing time rather than a hidden default.
+
+For deployments that want that residual closed, there is now an optional
+**protocol arbiter**: `set_arbiter(agent_id)` (creator only). When set, the
+arbiter is the second judge for **every** job — it supersedes any party-named
+fallback, so a worker's own puppet fallback can no longer act; the arbiter, a
+trusted independent judge, does, and a job neither the validator nor the arbiter
+answers still falls through to the 50/50 `SPLIT`. It is off by default
+(`arbiter_agent_id == 0`) and, unlike the fee, it is not one-shot — an arbiter key
+can be rotated. That it can be changed is exactly why it is a **trusted role**: a
+deployment that cannot assume an honest creator should leave it unset and rely on
+the named fallback and the SPLIT backstop.
 
 ## Deploying
 

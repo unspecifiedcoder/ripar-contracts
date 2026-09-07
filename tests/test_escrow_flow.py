@@ -501,3 +501,52 @@ def test_C1_worker_puppet_fallback_is_the_known_residual(world):
     world.advance(301)
     world.judge(puppet_acct, jid, True, puppet)
     assert world.status(jid) == VALIDATED
+
+
+# --- the protocol arbiter follow-up: closes C1 for deployments that opt in ----
+
+
+def test_arbiter_is_creator_only(world):
+    ctx = world.ctx
+    a = world.register(ctx.any.account(), "arbiter.example")
+    with pytest.raises(Exception, match="only the creator may set the arbiter"):
+        world.call(ctx.any.account(), world.validation.set_arbiter, arc4.UInt64(a))
+    world.call(world.creator, world.validation.set_arbiter, arc4.UInt64(a))
+    assert world.call(world.creator, world.validation.get_arbiter).native == a
+
+
+def test_arbiter_supersedes_a_puppet_fallback_and_closes_C1(world):
+    """With an arbiter set, a worker's own puppet fallback can no longer act — the
+    arbiter is the second judge for every job, so the C1 residual is closed for
+    deployments that opt in. The arbiter disputes the garbage; the client refunds."""
+    ctx = world.ctx
+    v = world.register(ctx.any.account(), "v.example")
+    arb_acct = ctx.any.account()
+    arb = world.register(arb_acct, "arbiter.example")
+    world.call(world.creator, world.validation.set_arbiter, arc4.UInt64(arb))
+
+    puppet_acct = ctx.any.account()
+    puppet = world.register(puppet_acct, "puppet.example")
+    client, w_acct, w, jid = _job(world, validator_id=v, escrow=1_000_000, fallback=puppet)
+    world.submit(w_acct, jid)
+    world.advance(301)  # validator silent
+
+    # the worker's puppet fallback is now powerless
+    with pytest.raises(Exception, match="only the named validator may judge, or the fallback/arbiter"):
+        world.judge(puppet_acct, jid, True, puppet)
+    # only the arbiter may act as the second judge, and it rejects the garbage
+    world.judge(arb_acct, jid, False, arb)
+    assert world.status(jid) == DISPUTED
+    assert world.call(client, world.validation.refund_escrow, arc4.UInt64(jid)).native == 1_000_000
+
+
+def test_arbiter_still_falls_back_to_split_if_even_it_is_silent(world):
+    ctx = world.ctx
+    v = world.register(ctx.any.account(), "v.example")
+    arb = world.register(ctx.any.account(), "arbiter.example")
+    world.call(world.creator, world.validation.set_arbiter, arc4.UInt64(arb))
+    client, w_acct, w, jid = _job(world, validator_id=v, escrow=1_000_000)
+    world.submit(w_acct, jid)
+    world.advance(602)  # validator and arbiter both silent
+    world.call(ctx.any.account(), world.validation.expire_verdict, arc4.UInt64(jid))
+    assert world.status(jid) == SPLIT

@@ -142,7 +142,7 @@
     "sourceHashPendingDeploy": {
       "IdentityRegistry": "81b4260127d8ac3e",
       "ReputationRegistry": "86fe00227823828b",
-      "ValidationRegistry": "132f0f4b3e9f9913",
+      "ValidationRegistry": "b29f2d040a1707b4",
       "how": "The approval-program sha256[:16] of the CURRENT committed/audited source in contracts/artifacts. These will become the on-chain hashes once the audited contracts are redeployed; until then no deployed app carries them."
     }
   }
